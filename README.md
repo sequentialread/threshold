@@ -3,7 +3,7 @@
 
 Public Internet facing gateway (TCP reverse tunnel) for server.garden.
 
-![](threshold.png)
+![](readme/splash.png)
 
 This project was originally forked from https://github.com/koding/tunnel
 
@@ -13,7 +13,7 @@ This repository only includes the application that does the tunneling part.  It 
 
 See the usage example folder for a basic test.
 
-![Diagram](readme/Diagram.png)
+![Diagram](readme/diagram.png)
 
 ### How it is intended to be used:
 
@@ -36,7 +36,6 @@ Starting the "listener" test app. It listens on port 9001.  This would be your w
   "DebugLog": false,
   "TunnelControlPort": 9056,
   "ManagementPort": 9057,
-  "UseTls": true,
   "CaCertificateFile": "InternalCA+chain.crt",
   "ServerTlsKeyFile": "localhost.key",
   "ServerTlsCertificateFile": "localhost+chain.crt"
@@ -48,11 +47,10 @@ Starting the tunnel client.  Client Identifier: TestClient1
 2020/08/06 14:00:04 theshold client is starting up using config:
 {
   "DebugLog": false,
-  "ClientIdentifier": "TestClient1",
+  "ClientId": "TestClient1",
   "ServerHost": "localhost",
   "ServerTunnelControlPort": 9056,
   "ServerManagementPort": 9057,
-  "UseTls": true,
   "ServiceToLocalAddrMap": {
     "fooService": "127.0.0.1:9001"
   },
@@ -69,7 +67,7 @@ Sending the tunnel configuration to the server.
 HTTP PUT localhost:9057/tunnels:
 now listening on 127.0.0.1:9000
 
-[{"HaProxyProxyProtocol":true,"ListenAddress":"127.0.0.1","ListenHostnameGlob":"*","ListenPort":9000,"BackEndService":"fooService","ClientIdentifier":"TestClient1"}]
+[{"HaProxyProxyProtocol":true,"ListenAddress":"127.0.0.1","ListenHostnameGlob":"*","ListenPort":9000,"BackEndService":"fooService","ClientId":"TestClient1"}]
 
 Starting the "sender" test app. 
 It connects to the front end port of the tunnel (port 9000).  This would be your end user who wants to use the web application.
