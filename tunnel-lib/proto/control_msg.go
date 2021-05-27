@@ -12,4 +12,5 @@ type Action int
 // ControlMessage actions.
 const (
 	RequestClientSession Action = iota + 1
+	RequestForwardProxy  Action = iota + 2
 )

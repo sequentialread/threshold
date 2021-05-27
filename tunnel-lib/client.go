@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,6 +98,8 @@ type Client struct {
 
 	// redialBackoff is used to reconnect in exponential backoff intervals
 	redialBackoff Backoff
+
+	incomingForwardProxyConnections chan net.Conn
 }
 
 // ClientConfig defines the configuration for the Client
@@ -126,7 +129,7 @@ type ClientConfig struct {
 	// where you can provide your local server selection or communication rules.
 	Proxy ProxyFunc
 
-	// Dial provides custom transport layer for client server communication.
+	// Dial provides custom transport layer for communication between the threshold client and threshold server.
 	//
 	// If nil, default implementation is to return net.Dial("tcp", address).
 	//
@@ -504,7 +507,29 @@ func (c *Client) connect(identifier, serverAddr string) error {
 
 	c.startNotifyIfNeeded()
 
-	return c.listenControl(ct)
+	// inline immediately invoked function expression to use defer
+	return (func() error {
+		c.ctrlWg.Add(1)
+		defer c.ctrlWg.Done()
+
+		c.incomingForwardProxyConnections = make(chan net.Conn)
+		c.changeState(ClientConnected, nil)
+
+		var err error
+		select {
+		case err = <-async(func() error { return c.listenControl(ct) }):
+			log.Printf("Client.listenControl() exited with: %+v\n", err)
+		case err = <-async(func() error { return c.listenForwardProxy(ct) }):
+			log.Printf("Client.listenForwardProxy() exited with: %+v\n", err)
+		}
+
+		c.session.GoAway()
+		c.session.Close()
+		ct.Close()
+		c.changeState(ClientDisconnected, err)
+		return err
+
+	})()
 }
 
 func (c *Client) dial(serverAddr string) (net.Conn, error) {
@@ -516,19 +541,9 @@ func (c *Client) dial(serverAddr string) (net.Conn, error) {
 }
 
 func (c *Client) listenControl(ct *control) error {
-	c.ctrlWg.Add(1)
-	defer c.ctrlWg.Done()
-
-	c.changeState(ClientConnected, nil)
-
 	for {
 		var msg proto.ControlMessage
 		if err := ct.dec.Decode(&msg); err != nil {
-			c.reqWg.Wait() // wait until all requests are finished
-			c.session.GoAway()
-			c.session.Close()
-			c.changeState(ClientDisconnected, err)
-
 			return fmt.Errorf("failure decoding control message: %s", err)
 		}
 
@@ -549,5 +564,106 @@ func (c *Client) listenControl(ct *control) error {
 			}
 			remote.Close()
 		}()
+	}
+}
+
+func (c *Client) HandleForwardProxy(conn net.Conn) error {
+	if c.state != ClientConnected {
+		conn.Close()
+		return errors.New("client is disconnected, can't accept any forward proxy connections")
+	} else {
+		c.incomingForwardProxyConnections <- conn
+		return nil
+	}
+}
+
+func (c *Client) listenForwardProxy(ct *control) error {
+
+	forwardProxyConnectionId := 0
+	for {
+		conn := <-c.incomingForwardProxyConnections
+
+		forwardProxyConnectionId++
+
+		if c.config.DebugLog {
+			log.Printf("Client.listenForwardProxy(): Received incoming forward proxy connection %d\n", forwardProxyConnectionId)
+		}
+
+		err := ct.send(proto.ControlMessage{Action: proto.RequestForwardProxy})
+		if err != nil {
+			return fmt.Errorf("failure seding control message: %s", err)
+		}
+
+		if c.config.DebugLog {
+			log.Printf("Client.listenForwardProxy(): forward proxy connection %d: sent RequestForwardProxy to server \n", forwardProxyConnectionId)
+		}
+
+		remoteConn, err := c.session.Accept()
+		if err != nil {
+			return err
+		}
+
+		if c.config.DebugLog {
+			log.Printf("Client.listenForwardProxy(): forward proxy connection %d: accepted yamux session \n", forwardProxyConnectionId)
+		}
+
+		go func() {
+			BlockingBidirectionalPipe(conn, remoteConn, "from client", "to SOCKS server", strconv.Itoa(forwardProxyConnectionId), c.config.DebugLog)
+			conn.Close()
+			remoteConn.Close()
+		}()
+	}
+}
+
+func BlockingBidirectionalPipe(conn1, conn2 net.Conn, name1, name2 string, connectionId string, debugLog bool) {
+	chanFromConn := func(conn net.Conn, name, connectionId string) chan []byte {
+		c := make(chan []byte)
+
+		go func() {
+			b := make([]byte, 1024)
+
+			for {
+				n, err := conn.Read(b)
+				if n > 0 {
+					res := make([]byte, n)
+					// Copy the buffer so it doesn't get changed while read by the recipient.
+					copy(res, b[:n])
+					c <- res
+				}
+				if err != nil {
+					log.Printf("%s %s read error %s\n", connectionId, name, err)
+					c <- nil
+					break
+				}
+			}
+		}()
+
+		return c
+	}
+
+	chan1 := chanFromConn(conn1, fmt.Sprint(name1, "->", name2), connectionId)
+	chan2 := chanFromConn(conn2, fmt.Sprint(name2, "->", name1), connectionId)
+
+	for {
+		select {
+		case b1 := <-chan1:
+			if b1 == nil {
+				if debugLog {
+					log.Printf("connection %s %s EOF\n", connectionId, name1)
+				}
+				return
+			} else {
+				conn2.Write(b1)
+			}
+		case b2 := <-chan2:
+			if b2 == nil {
+				if debugLog {
+					log.Printf("connection %s %s EOF\n", connectionId, name2)
+				}
+				return
+			} else {
+				conn1.Write(b2)
+			}
+		}
 	}
 }
