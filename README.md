@@ -1,13 +1,17 @@
 
-## threshold
+## threshold 🏔️⛰️🛤️⛰️🏔️
 
-Public Internet facing gateway (TCP reverse tunnel) for server.garden.
+Threshold was created to make self-hosting websites, email, and other services radically easier.
+
+Threshold implements a public-internet-facing gateway (TCP reverse tunnel & SOCKS5 forward proxy) for self-hosted servers. 
+
+The [greenhouse cloud service](https://git.sequentialread.com/forest/greenhouse) was developed in order to make threshold more easily accessible to more people. Greenhouse operates the server side of threshold as a service, charging $0.01 per GB of bandwidth.
 
 ![](readme/splash.png)
 
-This project was originally forked from https://github.com/koding/tunnel
+Threshold server is designed to be a **relatively untrusted** service, in other words, the user doesn't need to place much trust in the environment where the server runs. It's designed so that the server operator can't spy on you. This makes it uniquely suited to bridge the "ownership vs capability" gap between a self-hosted server/homelab/datacenter and a 3rd-party public cloud environment, hence the name threshold. 
 
-It is intended to be used to make it easier for non-tech-savvy people to host web services that are avaliable on the public internet.
+This project was originally forked from https://github.com/koding/tunnel
 
 This repository only includes the application that does the tunneling part.  It does not include any other management or automation tools.
 
@@ -15,13 +19,19 @@ See the usage example folder for a basic test.
 
 ![Diagram](readme/diagram.png)
 
+This diagram was created with https://app.diagrams.net/.
+To edit it, download the <a download href="readme/diagram.drawio">diagram file</a> and edit it with the https://app.diagrams.net/ web application, or you may run the application from [source](https://github.com/jgraph/drawio) if you wish.
+
+
 ### How it is intended to be used:
 
-1. An automated tool creates a cloud instance and installs and configures the tunnel server on it. 
-1. An automated tool installs the tunnel client on the self-hoster's server computer. 
-1. An automated tool calls the `PUT /tunnels` api on the tunnel server's Management Port, and sends a JSON file describing which ports should be opened on the tunnel server, which client they should be tunneled to, and which service on the client they should be tunneled to, as well as whether or not the HAProxy "PROXY" protocol should be used. This connection can use TLS Client Authentication.
-1. The tunnel client connects to the tunnel server on the Tunnel Control Port. This connection can use TLS Client Authentication. This connection will be held open and re-created if dropped.
-1. An internet user connects to the tunnel server on one of the ports defined in the JSON. The internet user's request is tunneled through the original connection from the tunnel client, and then proxied to the web server software running on the self-hoster's server computer.
+1. An automated tool creates a cloud instance and installs and configures the threshold server on it. 
+1. An automated tool installs the threshold client on the self-hoster's server computer. 
+1. An automated tool calls the `PUT /tunnels` api on the threshold server's Management Port, and sends a JSON file describing which ports should be opened on the threshold server, which client they should be tunneled to, and which service on the client they should be tunneled to, as well as whether or not the HAProxy "PROXY" protocol should be used. This connection can use TLS Client Authentication.
+1. The threshold client connects to the threshold server on the Tunnel Control Port. This connection can use TLS Client Authentication. This connection will be held open and re-created if dropped.
+1. An internet user connects to the threshold server on one of the ports defined in the JSON. The internet user's request is tunneled through the original connection from the threshold client, and then proxied to the web server software running on the self-hoster's server computer.
+1. (OPTIONAL) The server operator installs software (for example, email server) which requires outgoing requests to "come from" the same IP address that the server is listening for connections at.
+1. The email server or other software connects to the threshold client for SOCKS5 forward proxy. The threshold client forwards this connection through the existing tunnel connection to the threshold server (secured by TLS), then the threshold server handles the SOCKS5 connection and proxies it to the destination requested by the email server or other software. 
 
 
 ### Output from Usage example showing how it works:
@@ -91,10 +101,10 @@ Note how the listener sees the original source IP and port, not the source IP an
 
 I have a few requirements for this system. 
 
-* It should be 100% automatable. It is intended to be used in a situation where it is unreasonable to ask the user to configure thier router, for example, they don't know how, they don't want to, or they are not allowed to (For example they live in a dorm where the University manages the network).
-* Users have control over their own data.  We do not entrust cloud providers or 3rd parties with our data, TLS keys/certificates, etc. In terms of every day usage, this is a TLS connection from an internet user directly to the self-hoster's computer. It is opaque to the cloud provider. 
-  * If the cloud provider wants to launch a Man in the Middle attack, even if they could secretly obtain a trusted cert to use, it will not be easy to hide from the user as long as the user (or software that they installed) is anticipating it. 
-* It should support Failover/High Avaliability of services.  Therefore, it needs to be able to have multiple tunnel clients connected at once, which can be hot-swapped via a Management API.
+* It should be 100% automatable. It is intended to be used in a situation where it is unreasonable to ask the user to perform any sort of advanced manual configuration. 
+* Users have control over their own data.  We do not entrust cloud providers or 3rd parties with our data, even those who are hosting our threshold server. TLS keys/certificates, security-relevant configurations, etc only exist on the user-controlled computer. The cloud provider doesn't get access to any information or capability beyond what the user's ISP (Internet Service Provider) would normally have.
+  * If the cloud provider wants to launch a Man in the Middle attack against the threshold user, they will run into the same problems that an ISP would.
+* It should support Failover/High Avaliability of services.  Therefore, it needs to be able to have multiple tunnel clients connected at once, which can be hot-swapped via a management API.
 
 ### What did you add on top of the koding/tunnel package?
 
@@ -109,15 +119,16 @@ I have a few requirements for this system.
 * Introduced concept of a "service" string instead of port number, so the client decides what ports to connect to, not the server. 
 * Added support TLS SNI based virtual hosts. (Hostname based routing)
 * Fixed various bugs related to connection lifecycle.
+* Added a tunneled SOCKS5 proxy to support applications like email servers which need to be able to dial out from the same IP address that they recieve connections at.
 
 ### How to build
 
 ```
-go build -o tunnel -tags netgo 
+go build -o threshold
+```
 
-# -tags netgo? what?
-# this is a work around for dynamic linking on alpine linux
-# see: https://stackoverflow.com/questions/36279253/go-compiled-binary-wont-run-in-an-alpine-docker-container-on-ubuntu-host
+### How to build the docker image:
 
-docker build -t sequentialread/tunnel:0.0.1 .
+```
+./build-docker.sh
 ```
