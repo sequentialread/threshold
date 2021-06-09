@@ -591,7 +591,7 @@ func (c *Client) listenForwardProxy(ct *control) error {
 
 		err := ct.send(proto.ControlMessage{Action: proto.RequestForwardProxy})
 		if err != nil {
-			return fmt.Errorf("failure seding control message: %s", err)
+			return fmt.Errorf("failure sending control message: %s", err)
 		}
 
 		if c.config.DebugLog {

@@ -33,6 +33,7 @@ type ClientConfig struct {
 	GreenhouseDomain           string
 	GreenhouseAPIToken         string
 	GreenhouseThresholdPort    int
+	ForwardProxyListenAddress  string
 	ServerAddr                 string
 	Servers                    []string
 	ServiceToLocalAddrMap      *map[string]string
@@ -90,6 +91,17 @@ func runClient(configFileName *string) {
 	if config.GreenhouseThresholdPort == 0 {
 		config.GreenhouseThresholdPort = 9056
 	}
+	if config.ForwardProxyListenAddress == "" {
+		config.ForwardProxyListenAddress = "127.0.0.1:8000"
+	}
+	forwardProxyListenAddress, err := net.ResolveTCPAddr("tcp", config.ForwardProxyListenAddress)
+	if err != nil {
+		log.Fatalf("runClient(): can't net.ResolveTCPAddr(forwardProxyListenAddress) because %s \n", err)
+	}
+	forwardProxyListener, err := net.ListenTCP("tcp", forwardProxyListenAddress)
+	if err != nil {
+		log.Fatalf("runClient(): can't net.ListenTCP(\"tcp\", forwardProxyListenAddress) because %s \n", err)
+	}
 
 	clientServers = []ClientServer{}
 	makeServer := func(hostPort string) ClientServer {
@@ -103,6 +115,8 @@ func runClient(configFileName *string) {
 			ServerUrl:      serverURL,
 		}
 	}
+
+	serverListToLog := ""
 
 	if config.GreenhouseDomain != "" {
 		if config.ServerAddr != "" {
@@ -123,6 +137,7 @@ func runClient(configFileName *string) {
 		}
 		request.Header.Add("Authorization", fmt.Sprintf("Bearer %s", config.GreenhouseAPIToken))
 
+		hostPortStringsToLog := []string{}
 		response, err := greenhouseClient.Do(request)
 		if err != nil || response.StatusCode != 200 {
 			if err == nil {
@@ -138,7 +153,9 @@ func runClient(configFileName *string) {
 				log.Fatalf("Failed to lookup GreenhouseDomain '%s'", config.GreenhouseDomain)
 			}
 			for _, ip := range ips {
-				clientServers = append(clientServers, makeServer(fmt.Sprintf("%s:%d", ip, config.GreenhouseThresholdPort)))
+				serverHostPort := fmt.Sprintf("%s:%d", ip, config.GreenhouseThresholdPort)
+				clientServers = append(clientServers, makeServer(serverHostPort))
+				hostPortStringsToLog = append(hostPortStringsToLog, serverHostPort)
 			}
 		} else {
 			responseBytes, err := ioutil.ReadAll(response.Body)
@@ -150,10 +167,14 @@ func runClient(configFileName *string) {
 			if err != nil {
 				log.Fatal("http read error GET '%s'", greenhouseURL)
 			}
+
 			for _, serverHostPort := range tenantInfo.ThresholdServers {
 				clientServers = append(clientServers, makeServer(serverHostPort))
+				hostPortStringsToLog = append(hostPortStringsToLog, serverHostPort)
 			}
 		}
+
+		serverListToLog = fmt.Sprintf("%s (%s)", config.GreenhouseDomain, strings.Join(hostPortStringsToLog, ", "))
 
 	} else if config.Servers != nil && len(config.Servers) > 0 {
 		if config.ServerAddr != "" {
@@ -162,8 +183,10 @@ func runClient(configFileName *string) {
 		for _, serverHostPort := range config.Servers {
 			clientServers = append(clientServers, makeServer(serverHostPort))
 		}
+		serverListToLog = fmt.Sprintf("[%s]", strings.Join(config.Servers, ", "))
 	} else {
 		clientServers = []ClientServer{makeServer(config.ServerAddr)}
+		serverListToLog = config.ServerAddr
 	}
 
 	if config.ServiceToLocalAddrMap != nil {
@@ -325,10 +348,29 @@ func runClient(configFileName *string) {
 		go server.Client.Start()
 	}
 
-	log.Print("runClient(): the client should be running now\n")
+	log.Printf(
+		"runClient(): the threshold client should be running now 🏔️⛰️🛤️⛰️🏔️ \n connecting to %s... \n",
+		serverListToLog,
+	)
 
-	blockForever := make(chan int)
-	<-blockForever
+	log.Printf(
+		"runClient(): I am listening on %s for SOCKS5 forward proxy \n",
+		config.ForwardProxyListenAddress,
+	)
+
+	for {
+		conn, err := forwardProxyListener.Accept()
+		if err != nil {
+			log.Printf("Can't accept incoming connection: forwardProxyListener.Accept() returned %s\n", err)
+		}
+
+		// TODO better way of determining which one to use for forward proxy.
+		err = clientServers[0].Client.HandleForwardProxy(conn)
+		if err != nil {
+			log.Printf("Can't accept incoming connection %s -> %s because %s\n", conn.RemoteAddr, conn.LocalAddr, err)
+		}
+	}
+
 }
 
 func runClientAdminApi(config ClientConfig) {
