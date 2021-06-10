@@ -4,7 +4,6 @@
 package tunnel
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,8 +15,10 @@ import (
 	"sync"
 	"time"
 
+	errors "git.sequentialread.com/forest/pkg-errors"
 	"git.sequentialread.com/forest/threshold/tunnel-lib/proto"
 
+	"github.com/armon/go-socks5"
 	"github.com/hashicorp/yamux"
 )
 
@@ -40,6 +41,8 @@ type Server struct {
 	sessions map[string]*yamux.Session
 	// sessionsMu protects sessions.
 	sessionsMu sync.Mutex
+
+	socks5Server *socks5.Server
 
 	// controls contains the control connection from the client to the server.
 	controls *controls
@@ -142,9 +145,16 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		connCh: connCh,
 	}
 
+	socks5Server, err := socks5.New(&socks5.Config{})
+
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create new socks5 server")
+	}
+
 	s := &Server{
 		pending:               make(map[string]chan net.Conn),
 		sessions:              make(map[string]*yamux.Session),
+		socks5Server:          socks5Server,
 		onConnectCallbacks:    newCallbacks("OnConnect"),
 		onDisconnectCallbacks: newCallbacks("OnDisconnect"),
 		virtualAddrs:          newVirtualAddrs(opts),
@@ -253,17 +263,19 @@ func (s *Server) handleTCPConn(conn net.Conn) error {
 
 	disconnectedChan := make(chan bool)
 
+	// We don't include remote address or service info here
+	// because the server should only collect the minimum required amount of metric data
+	//  -- the client can collect more detailed metrics if they want.
+
 	inboundMetric := BandwidthMetric{
-		Service:       listenerInfo.BackendService,
-		ClientId:      listenerInfo.AssociatedClientId,
-		RemoteAddress: conn.RemoteAddr(),
-		Inbound:       true,
+		Service:  listenerInfo.BackendService,
+		ClientId: listenerInfo.AssociatedClientId,
+		Inbound:  true,
 	}
 	outboundMetric := BandwidthMetric{
-		Service:       listenerInfo.BackendService,
-		ClientId:      listenerInfo.AssociatedClientId,
-		RemoteAddress: conn.RemoteAddr(),
-		Inbound:       false,
+		Service:  listenerInfo.BackendService,
+		ClientId: listenerInfo.AssociatedClientId,
+		Inbound:  false,
 	}
 
 	go s.proxy(disconnectedChan, conn, stream, outboundMetric, s.bandwidth, "outbound from tunnel to remote client")
@@ -293,65 +305,6 @@ func (s *Server) proxy(disconnectedChan chan bool, dst, src net.Conn, metric Ban
 	if s.debugLog {
 		log.Printf("Server.proxy(): tunneled %d bytes %s -> %s (%s): %v\n", n, src.RemoteAddr(), dst.RemoteAddr(), side, err)
 	}
-}
-
-// copied from the go standard library source code (io.Copy) with metric collection added.
-func ioCopyWithMetrics(dst io.Writer, src io.Reader, metric BandwidthMetric, bandwidth chan<- BandwidthMetric) (written int64, err error) {
-	size := 32 * 1024
-	if l, ok := src.(*io.LimitedReader); ok && int64(size) > l.N {
-		if l.N < 1 {
-			size = 1
-		} else {
-			size = int(l.N)
-		}
-	}
-	chunkForMetrics := 0
-	buf := make([]byte, size)
-
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			nw, ew := dst.Write(buf[0:nr])
-			if nw > 0 {
-				chunkForMetrics += nw
-				if chunkForMetrics >= metricChunkSize {
-					bandwidth <- BandwidthMetric{
-						Inbound:       metric.Inbound,
-						Service:       metric.Service,
-						ClientId:      metric.ClientId,
-						RemoteAddress: metric.RemoteAddress,
-						Bytes:         chunkForMetrics,
-					}
-					chunkForMetrics = 0
-				}
-				written += int64(nw)
-			}
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-	if chunkForMetrics > 0 {
-		bandwidth <- BandwidthMetric{
-			Inbound:       metric.Inbound,
-			Service:       metric.Service,
-			ClientId:      metric.ClientId,
-			RemoteAddress: metric.RemoteAddress,
-			Bytes:         chunkForMetrics,
-		}
-	}
-	return written, err
 }
 
 func (s *Server) dial(identifier string, service string) (net.Conn, error) {
@@ -515,12 +468,19 @@ func (s *Server) controlHandler(w http.ResponseWriter, r *http.Request) (ctErr e
 func (s *Server) listenControl(ct *control) {
 	s.onConnect(ct.identifier)
 
+	connectionId := 0
 	for {
-		var msg map[string]interface{}
+
+		connectionId++
+
+		var msg proto.ControlMessage
 		err := ct.dec.Decode(&msg)
 		if err != nil {
 			if s.debugLog {
-				log.Printf("Server.listenControl(): Closing client connection:  '%s'\n", ct.identifier)
+				log.Printf(
+					"Server.listenControl(): connectionId: %d: Closing  connection for client: '%s'\n",
+					connectionId, ct.identifier,
+				)
 			}
 
 			// close client connection so it reconnects again
@@ -533,7 +493,7 @@ func (s *Server) listenControl(ct *control) {
 			s.onDisconnect(ct.identifier, err)
 
 			if err != io.EOF {
-				log.Printf("Server.listenControl(): decode err: %s\n", err)
+				log.Printf("Server.listenControl(): connectionId: %d decode err: %s\n", connectionId, err)
 			}
 			return
 		}
@@ -542,7 +502,44 @@ func (s *Server) listenControl(ct *control) {
 		// underlying connection needs to establihsed, we know when we have
 		// disconnection(above), so we can cleanup the connection.
 		if s.debugLog {
-			log.Printf("Server.listenControl(): msg: %s\n", msg)
+			log.Printf("Server.listenControl(): connectionId: %d msg: %s\n", connectionId, msg)
+		}
+
+		if msg.Action == proto.RequestForwardProxy {
+			session, err := s.getSession(ct.identifier)
+			if err != nil {
+				fmt.Printf(
+					"failed to accept RequestForwardProxy from client '%s' connectionId: %d: getSession() returned %s\n",
+					connectionId, ct.identifier, err,
+				)
+			}
+			remote, err := session.Open()
+			if err != nil {
+				fmt.Printf(
+					"failed to accept RequestForwardProxy from client '%s' connectionId: %d: session.Open() returned %s\n",
+					connectionId, ct.identifier, err,
+				)
+			}
+
+			go func(connectionId int) {
+				defer remote.Close()
+				metricsWrappedConn := ConnWithMetrics{
+					underlying:     remote,
+					metricsChannel: s.bandwidth,
+					inbound:        false,
+					clientId:       ct.identifier,
+				}
+				err := s.socks5Server.ServeConn(metricsWrappedConn)
+				if err != nil {
+					fmt.Printf(
+						"error in RequestForwardProxy from client '%s' connectionId: %d: socks5Server.ServeConn() failed with %s\n",
+						ct.identifier, connectionId, err,
+					)
+				}
+			}(connectionId)
+
+		} else {
+			fmt.Printf("control message from client had action = %d, expected %d\n", msg.Action, proto.RequestForwardProxy)
 		}
 	}
 }

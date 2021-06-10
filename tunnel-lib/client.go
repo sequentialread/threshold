@@ -549,9 +549,15 @@ func (c *Client) listenControl(ct *control) error {
 
 		if c.config.DebugLog {
 			log.Printf("Client.connect(): Received control msg %+v\n", msg)
-			log.Println("Client.connect(): Opening a new stream from server session")
 		}
 
+		if msg.Action != proto.RequestClientSession {
+			return fmt.Errorf("control message from server had action = %d, expected %d", msg.Action, proto.RequestClientSession)
+		}
+
+		if c.config.DebugLog {
+			log.Println("Client.connect(): Opening a new stream from server session")
+		}
 		remote, err := c.session.Open()
 		if err != nil {
 			return err
@@ -608,62 +614,9 @@ func (c *Client) listenForwardProxy(ct *control) error {
 		}
 
 		go func() {
-			BlockingBidirectionalPipe(conn, remoteConn, "from client", "to SOCKS server", strconv.Itoa(forwardProxyConnectionId), c.config.DebugLog)
+			blockingBidirectionalPipe(conn, remoteConn, "from client", "to SOCKS server", strconv.Itoa(forwardProxyConnectionId), c.config.DebugLog)
 			conn.Close()
 			remoteConn.Close()
 		}()
-	}
-}
-
-func BlockingBidirectionalPipe(conn1, conn2 net.Conn, name1, name2 string, connectionId string, debugLog bool) {
-	chanFromConn := func(conn net.Conn, name, connectionId string) chan []byte {
-		c := make(chan []byte)
-
-		go func() {
-			b := make([]byte, 1024)
-
-			for {
-				n, err := conn.Read(b)
-				if n > 0 {
-					res := make([]byte, n)
-					// Copy the buffer so it doesn't get changed while read by the recipient.
-					copy(res, b[:n])
-					c <- res
-				}
-				if err != nil {
-					log.Printf("%s %s read error %s\n", connectionId, name, err)
-					c <- nil
-					break
-				}
-			}
-		}()
-
-		return c
-	}
-
-	chan1 := chanFromConn(conn1, fmt.Sprint(name1, "->", name2), connectionId)
-	chan2 := chanFromConn(conn2, fmt.Sprint(name2, "->", name1), connectionId)
-
-	for {
-		select {
-		case b1 := <-chan1:
-			if b1 == nil {
-				if debugLog {
-					log.Printf("connection %s %s EOF\n", connectionId, name1)
-				}
-				return
-			} else {
-				conn2.Write(b1)
-			}
-		case b2 := <-chan2:
-			if b2 == nil {
-				if debugLog {
-					log.Printf("connection %s %s EOF\n", connectionId, name2)
-				}
-				return
-			} else {
-				conn1.Write(b2)
-			}
-		}
 	}
 }
