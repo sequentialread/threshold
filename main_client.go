@@ -25,6 +25,7 @@ import (
 	tunnel "git.sequentialread.com/forest/threshold/tunnel-lib"
 	"git.sequentialread.com/forest/threshold/tunnel-lib/proto"
 	proxyprotocol "github.com/armon/go-proxyproto"
+	"golang.org/x/net/proxy"
 )
 
 type ClientConfig struct {
@@ -42,6 +43,7 @@ type ClientConfig struct {
 	CaCertificate              string
 	ClientTlsKey               string
 	ClientTlsCertificate       string
+	LocalSOCKS5Address         string // use this when a local proxy is required to talk to the threshold server.
 	AdminUnixSocket            string
 	AdminAPIPort               int
 	AdminAPICACertificateFile  string
@@ -186,6 +188,14 @@ func runClient(configFileName *string) {
 
 	dialFunction := net.Dial
 
+	if config.LocalSOCKS5Address != "" {
+		dialer, err := proxy.SOCKS5("tcp", "PROXY_IP", nil, proxy.Direct)
+		if err != nil {
+			log.Fatal("can't connect to the proxy:", err)
+		}
+		dialFunction = dialer.Dial
+	}
+
 	var cert tls.Certificate
 	hasFiles := config.ClientTlsCertificateFile != "" && config.ClientTlsKeyFile != ""
 	hasLiterals := config.ClientTlsCertificate != "" && config.ClientTlsKey != ""
@@ -269,8 +279,19 @@ func runClient(configFileName *string) {
 	}
 	tlsClientConfig.BuildNameToCertificate()
 
+	// wrap whatever dial function we have right now with TLS.
+	existingDialFunction := dialFunction
 	dialFunction = func(network, address string) (net.Conn, error) {
-		return tls.Dial(network, address, tlsClientConfig)
+		conn, err := existingDialFunction(network, address)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(conn, tlsClientConfig)
+		err = tlsConn.Handshake()
+		if err != nil {
+			return nil, err
+		}
+		return tlsConn, nil
 	}
 
 	go runClientAdminApi(config)
