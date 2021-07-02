@@ -28,6 +28,7 @@ To edit it, download the <a download href="readme/diagram.drawio">diagram file</
 1. The tunnel client connects to the tunnel server on the Tunnel Control Port. This connection can use TLS Client Authentication. This connection will be held open and re-created if dropped.
 1. An internet user connects to the tunnel server on one of the ports defined in the JSON. The internet user's request is tunneled through the original connection from the tunnel client, and then proxied to the web server software running on the self-hoster's server computer.
 
+Note: if you wish to easily create server/client key pairs that will work with threshold, see: https://git.sequentialread.com/forest/make-fake-cert
 
 ### Output from Usage example showing how it works:
 

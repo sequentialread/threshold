@@ -3,6 +3,7 @@ module git.sequentialread.com/forest/threshold
 go 1.14
 
 require (
+	git.sequentialread.com/forest/pkg-errors v0.9.2 // indirect
 	github.com/armon/go-proxyproto v0.0.0-20210323213023-7e956b284f0a
 	github.com/cenkalti/backoff v2.1.0+incompatible
 	github.com/gorilla/websocket v1.4.0
