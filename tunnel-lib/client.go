@@ -202,9 +202,11 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		proxy = (&TCPProxy{FetchLocalAddr: cfg.FetchLocalAddr, DebugLog: cfg.DebugLog}).Proxy
 	}
 
-	var bo Backoff = newForeverBackoff()
+	var bo Backoff
 	if cfg.Backoff != nil {
 		bo = cfg.Backoff
+	} else {
+		bo = NewExponentialBackoff()
 	}
 
 	client := &Client{

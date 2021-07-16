@@ -34,20 +34,21 @@ import (
 )
 
 type ClientConfig struct {
-	DebugLog                 bool
-	ClientId                 string
-	GreenhouseDomain         string
-	GreenhouseAPIToken       string
-	GreenhouseThresholdPort  int
-	ServerAddr               string
-	Servers                  []string
-	DefaultTunnels           *LiveConfigUpdate
-	CaCertificateFilesGlob   string
-	ClientTlsKeyFile         string
-	ClientTlsCertificateFile string
-	CaCertificate            string
-	ClientTlsKey             string
-	ClientTlsCertificate     string
+	DebugLog                      bool
+	ClientId                      string
+	GreenhouseDomain              string
+	GreenhouseAPIToken            string
+	GreenhouseThresholdPort       int
+	MaximumConnectionRetrySeconds int
+	ServerAddr                    string
+	Servers                       []string
+	DefaultTunnels                *LiveConfigUpdate
+	CaCertificateFilesGlob        string
+	ClientTlsKeyFile              string
+	ClientTlsCertificateFile      string
+	CaCertificate                 string
+	ClientTlsKey                  string
+	ClientTlsCertificate          string
 
 	// use this when a local proxy is required to talk to the threshold server.
 	// if you set the hostname to "gateway", like "LocalSOCKS5Address": "gateway:1080"
@@ -75,6 +76,23 @@ type LiveConfigUpdate struct {
 
 type ThresholdTenantInfo struct {
 	ThresholdServers []string
+}
+
+type maximumBackoff struct {
+	Maximum time.Duration
+	Base    tunnel.Backoff
+}
+
+func (bo *maximumBackoff) NextBackOff() time.Duration {
+	result := bo.Base.NextBackOff()
+	if result > bo.Maximum {
+		return bo.Maximum
+	}
+	return result
+}
+
+func (bo *maximumBackoff) Reset() {
+	bo.Base.Reset()
 }
 
 type clientAdminAPI struct{}
@@ -356,7 +374,16 @@ func runClient(configFileName *string) {
 		}
 	}
 
+	maximumConnectionRetrySeconds := 60
+	if config.MaximumConnectionRetrySeconds != 0 {
+		maximumConnectionRetrySeconds = config.MaximumConnectionRetrySeconds
+	}
 	for _, server := range clientServers {
+		// make a separate backoff instance for each server.
+		myBackoff := maximumBackoff{
+			Maximum: time.Second * time.Duration(maximumConnectionRetrySeconds),
+			Base:    tunnel.NewExponentialBackoff(),
+		}
 		clientStateChanges := make(chan *tunnel.ClientStateChange)
 		tunnelClientConfig := &tunnel.ClientConfig{
 			DebugLog:       config.DebugLog,
@@ -366,6 +393,7 @@ func runClient(configFileName *string) {
 			Proxy:          proxyFunc,
 			Dial:           dialFunction,
 			StateChanges:   clientStateChanges,
+			Backoff:        &myBackoff,
 		}
 
 		client, err := tunnel.NewClient(tunnelClientConfig)
