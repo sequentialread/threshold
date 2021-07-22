@@ -14,8 +14,8 @@ import (
 	"os"
 	"time"
 
-	tunnel "git.sequentialread.com/forest/tunnel/tunnel-lib"
-	"git.sequentialread.com/forest/tunnel/tunnel-lib/tunneltest"
+	tunnel "git.sequentialread.com/forest/threshold/tunnel-lib"
+	"git.sequentialread.com/forest/threshold/tunnel-lib/tunneltest"
 
 	"github.com/gorilla/websocket"
 )

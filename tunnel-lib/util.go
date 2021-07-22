@@ -35,7 +35,7 @@ type expBackoff struct {
 	bk *backoff.ExponentialBackOff
 }
 
-func newForeverBackoff() *expBackoff {
+func NewExponentialBackoff() *expBackoff {
 	eb := &expBackoff{
 		bk: backoff.NewExponentialBackOff(),
 	}

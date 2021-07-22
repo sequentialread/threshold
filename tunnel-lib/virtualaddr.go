@@ -208,12 +208,13 @@ func (vaddr *vaddrStorage) Delete(ip net.IP, port int, hostnameGlob string) {
 
 func (vaddr *vaddrStorage) newListener(ip net.IP, port int) (*listener, error) {
 	listenAddress := net.JoinHostPort(ip.String(), strconv.Itoa(port))
-	fmt.Printf("now listening on %s\n\n", listenAddress)
 
 	netListener, err := net.Listen("tcp", listenAddress)
 	if err != nil {
 		return nil, err
 	}
+
+	fmt.Printf("now listening on %s\n\n", listenAddress)
 
 	return &listener{
 		Listener:     netListener,

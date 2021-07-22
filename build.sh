@@ -4,7 +4,7 @@ function build() {
 	rm -rf build
 	mkdir build
 
-	GOOS=linux GOARCH=$1 go build -o build/threshold
+	GOOS=linux GOARCH=$1 go build -tags 'osusergo netgo'  -ldflags='-extldflags=-static'  -o build/threshold
 
 	sha256sum build/threshold
 
@@ -44,6 +44,6 @@ function build() {
 
 }
 
-#build arm
+build arm
 build amd64
 #build arm64

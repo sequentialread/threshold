@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -19,30 +21,49 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
+	errors "git.sequentialread.com/forest/pkg-errors"
 	tunnel "git.sequentialread.com/forest/threshold/tunnel-lib"
 	"git.sequentialread.com/forest/threshold/tunnel-lib/proto"
 	proxyprotocol "github.com/armon/go-proxyproto"
+	"golang.org/x/net/proxy"
 )
 
 type ClientConfig struct {
-	DebugLog                   bool
-	ClientId                   string
-	GreenhouseDomain           string
-	GreenhouseAPIToken         string
-	GreenhouseThresholdPort    int
-	ForwardProxyListenAddress  string
-	ServerAddr                 string
-	Servers                    []string
-	ServiceToLocalAddrMap      *map[string]string
-	CaCertificateFilesGlob     string
-	ClientTlsKeyFile           string
-	ClientTlsCertificateFile   string
-	CaCertificate              string
-	ClientTlsKey               string
-	ClientTlsCertificate       string
+	DebugLog                bool
+	ClientId                string
+	GreenhouseDomain        string
+	GreenhouseAPIToken      string
+	GreenhouseThresholdPort int
+
+	// Theshold client will listen for SOCKS5 connections on the specified port (for example, "127.0.0.1:1080")
+	// and tunnel them to the threshold server, where the server will handle the SOCKS5 CONNECT requests
+	// and proxy the connections. Use this for hosting email servers or any other server where Outbound
+	// connections have to come from the same IP address which is used for Inbound connections
+	TunneledOutboundSOCKS5ListenAddress string
+
+	MaximumConnectionRetrySeconds int
+	ServerAddr                    string
+	Servers                       []string
+	DefaultTunnels                *LiveConfigUpdate
+	CaCertificateFilesGlob        string
+	ClientTlsKeyFile              string
+	ClientTlsCertificateFile      string
+	CaCertificate                 string
+	ClientTlsKey                  string
+	ClientTlsCertificate          string
+
+	// Use this when a local proxy is required for threshold client (this app) to talk to the threshold server.
+	// For example, if a firewall or other hostile network environment might otherwise prevent you from connecting.
+	// This would be the address of an external 3rd party SOCKS5 proxy server that is reachable from your computer.
+	// If you set the hostname to "gateway", like "HostileNetworkEnvironmentEvasionSOCKS5Address": "gateway:1080"
+	// then it will try to SOCKS5 connect to any/all default gateways (routers) on the given port (1080 in this case).
+	HostileNetworkEnvironmentEvasionSOCKS5Address string
+
 	AdminUnixSocket            string
 	AdminAPIPort               int
 	AdminAPICACertificateFile  string
@@ -64,6 +85,23 @@ type LiveConfigUpdate struct {
 
 type ThresholdTenantInfo struct {
 	ThresholdServers []string
+}
+
+type maximumBackoff struct {
+	Maximum time.Duration
+	Base    tunnel.Backoff
+}
+
+func (bo *maximumBackoff) NextBackOff() time.Duration {
+	result := bo.Base.NextBackOff()
+	if result > bo.Maximum {
+		return bo.Maximum
+	}
+	return result
+}
+
+func (bo *maximumBackoff) Reset() {
+	bo.Base.Reset()
 }
 
 type clientAdminAPI struct{}
@@ -91,16 +129,16 @@ func runClient(configFileName *string) {
 	if config.GreenhouseThresholdPort == 0 {
 		config.GreenhouseThresholdPort = 9056
 	}
-	if config.ForwardProxyListenAddress == "" {
-		config.ForwardProxyListenAddress = "127.0.0.1:8000"
+	if config.TunneledOutboundSOCKS5ListenAddress == "" {
+		config.TunneledOutboundSOCKS5ListenAddress = "127.0.0.1:8000"
 	}
-	forwardProxyListenAddress, err := net.ResolveTCPAddr("tcp", config.ForwardProxyListenAddress)
+	TunneledOutboundSOCKS5ListenAddress, err := net.ResolveTCPAddr("tcp", config.TunneledOutboundSOCKS5ListenAddress)
 	if err != nil {
-		log.Fatalf("runClient(): can't net.ResolveTCPAddr(forwardProxyListenAddress) because %s \n", err)
+		log.Fatalf("runClient(): can't net.ResolveTCPAddr(TunneledOutboundSOCKS5ListenAddress) because %s \n", err)
 	}
-	forwardProxyListener, err := net.ListenTCP("tcp", forwardProxyListenAddress)
+	forwardProxyListener, err := net.ListenTCP("tcp", TunneledOutboundSOCKS5ListenAddress)
 	if err != nil {
-		log.Fatalf("runClient(): can't net.ListenTCP(\"tcp\", forwardProxyListenAddress) because %s \n", err)
+		log.Fatalf("runClient(): can't net.ListenTCP(\"tcp\", TunneledOutboundSOCKS5ListenAddress) because %s \n", err)
 	}
 
 	clientServers = []ClientServer{}
@@ -189,8 +227,8 @@ func runClient(configFileName *string) {
 		serverListToLog = config.ServerAddr
 	}
 
-	if config.ServiceToLocalAddrMap != nil {
-		serviceToLocalAddrMap = config.ServiceToLocalAddrMap
+	if config.DefaultTunnels != nil {
+		serviceToLocalAddrMap = &config.DefaultTunnels.ServiceToLocalAddrMap
 	} else {
 		serviceToLocalAddrMap = &(map[string]string{})
 	}
@@ -204,10 +242,40 @@ func runClient(configFileName *string) {
 		configToLogString,
 		"$1******$2",
 	)
+	configToLogString = regexp.MustCompile(
+		`("(CaCertificate|ClientTlsKey|ClientTlsCertificate)": "[^"]{27})[^"]+([^"]{27}")`,
+	).ReplaceAllString(
+		configToLogString,
+		"$1 blahblahPEMblahblah $3",
+	)
 
 	log.Printf("theshold client is starting up using config:\n%s\n", configToLogString)
 
+	var proxyDialer proxy.Dialer = nil
 	dialFunction := net.Dial
+
+	if config.HostileNetworkEnvironmentEvasionSOCKS5Address != "" {
+		proxyDialer, err = getProxyDialer(config.HostileNetworkEnvironmentEvasionSOCKS5Address)
+		if err != nil {
+			log.Fatalf("can't start because can't getProxyDialer(): %+v", err)
+		}
+		dialFunction = func(network, address string) (net.Conn, error) {
+			var err error
+			if proxyDialer == nil {
+				proxyDialer, err = getProxyDialer(config.HostileNetworkEnvironmentEvasionSOCKS5Address)
+				if err != nil {
+					return nil, errors.Wrap(err, "dialFunction failed to recreate proxyDialer: ")
+				}
+			}
+
+			// if it fails, set it to null so it will be re-created // TODO test this and verify it actually works 0__0
+			conn, err := proxyDialer.Dial(network, address)
+			if err != nil {
+				proxyDialer = nil
+			}
+			return conn, err
+		}
+	}
 
 	var cert tls.Certificate
 	hasFiles := config.ClientTlsCertificateFile != "" && config.ClientTlsKeyFile != ""
@@ -215,12 +283,12 @@ func runClient(configFileName *string) {
 	if hasFiles && !hasLiterals {
 		cert, err = tls.LoadX509KeyPair(config.ClientTlsCertificateFile, config.ClientTlsKeyFile)
 		if err != nil {
-			log.Fatal(fmt.Sprintf("can't start because tls.LoadX509KeyPair returned: \n%+v\n", err))
+			log.Fatalf("can't start because tls.LoadX509KeyPair returned: \n%+v\n", err)
 		}
 	} else if !hasFiles && hasLiterals {
 		cert, err = tls.X509KeyPair([]byte(config.ClientTlsCertificate), []byte(config.ClientTlsKey))
 		if err != nil {
-			log.Fatal(fmt.Sprintf("can't start because tls.X509KeyPair returned: \n%+v\n", err))
+			log.Fatalf("can't start because tls.X509KeyPair returned: \n%+v\n", err)
 		}
 
 	} else {
@@ -292,8 +360,25 @@ func runClient(configFileName *string) {
 	}
 	tlsClientConfig.BuildNameToCertificate()
 
+	// wrap whatever dial function we have right now with TLS.
+	existingDialFunction := dialFunction
 	dialFunction = func(network, address string) (net.Conn, error) {
-		return tls.Dial(network, address, tlsClientConfig)
+		conn, err := existingDialFunction(network, address)
+		if err != nil {
+			return nil, err
+		}
+
+		addressSplit := strings.Split(address, ":")
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName:   addressSplit[0],
+			Certificates: tlsClientConfig.Certificates,
+			RootCAs:      tlsClientConfig.RootCAs,
+		})
+		err = tlsConn.Handshake()
+		if err != nil {
+			return nil, err
+		}
+		return tlsConn, nil
 	}
 
 	go runClientAdminApi(config)
@@ -320,7 +405,16 @@ func runClient(configFileName *string) {
 		}
 	}
 
+	maximumConnectionRetrySeconds := 60
+	if config.MaximumConnectionRetrySeconds != 0 {
+		maximumConnectionRetrySeconds = config.MaximumConnectionRetrySeconds
+	}
 	for _, server := range clientServers {
+		// make a separate backoff instance for each server.
+		myBackoff := maximumBackoff{
+			Maximum: time.Second * time.Duration(maximumConnectionRetrySeconds),
+			Base:    tunnel.NewExponentialBackoff(),
+		}
 		clientStateChanges := make(chan *tunnel.ClientStateChange)
 		tunnelClientConfig := &tunnel.ClientConfig{
 			DebugLog:       config.DebugLog,
@@ -330,6 +424,7 @@ func runClient(configFileName *string) {
 			Proxy:          proxyFunc,
 			Dial:           dialFunction,
 			StateChanges:   clientStateChanges,
+			Backoff:        &myBackoff,
 		}
 
 		client, err := tunnel.NewClient(tunnelClientConfig)
@@ -341,6 +436,20 @@ func runClient(configFileName *string) {
 			for {
 				stateChange := <-clientStateChanges
 				log.Printf("%s clientStateChange: %s\n", server.ServerHostPort, stateChange.String())
+				if config.DefaultTunnels != nil && stateChange.Current == tunnel.ClientConnected {
+					go (func() {
+						failed := true
+						for failed {
+							err := updateListenersOnServer(config.DefaultTunnels.Listeners)
+							if err != nil {
+								log.Printf("DefaultTunnels: failed to updateListenersOnServer(): %+v\nRetrying in 5 seconds...\n", err)
+								time.Sleep(time.Second * 5)
+							} else {
+								failed = false
+							}
+						}
+					})()
+				}
 			}
 		})()
 
@@ -355,7 +464,7 @@ func runClient(configFileName *string) {
 
 	log.Printf(
 		"runClient(): I am listening on %s for SOCKS5 forward proxy \n",
-		config.ForwardProxyListenAddress,
+		config.TunneledOutboundSOCKS5ListenAddress,
 	)
 
 	for {
@@ -484,65 +593,15 @@ func (handler clientAdminAPI) ServeHTTP(response http.ResponseWriter, request *h
 				return
 			}
 
-			sendBytes, err := json.Marshal(configUpdate.Listeners)
+			err = updateListenersOnServer(configUpdate.Listeners)
 			if err != nil {
-				log.Printf("clientAdminAPI: Listeners json serialization failed: %+v\n\n", err)
-				http.Error(response, "500 Listeners json serialization failed", http.StatusInternalServerError)
+				log.Printf("clientAdminAPI: can't updateListenersOnServer(): %+v\n\n", err)
+				http.Error(response, "500 internal server error", http.StatusInternalServerError)
 				return
-			}
-			client := &http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig: tlsClientConfig,
-				},
-				Timeout: 10 * time.Second,
-			}
-
-			// TODO make this concurrent requests, not one by one.
-			for _, server := range clientServers {
-				apiURL := fmt.Sprintf("https://%s/tunnels", server.ServerHostPort)
-				tunnelsRequest, err := http.NewRequest("PUT", apiURL, bytes.NewReader(sendBytes))
-				if err != nil {
-					log.Printf("clientAdminAPI: error creating tunnels request: %+v\n\n", err)
-					http.Error(response, "500 error creating tunnels request", http.StatusInternalServerError)
-					return
-				}
-				tunnelsRequest.Header.Add("content-type", "application/json")
-
-				tunnelsResponse, err := client.Do(tunnelsRequest)
-				if err != nil {
-					log.Printf("clientAdminAPI: Do(tunnelsRequest): %+v\n\n", err)
-					http.Error(response, "502 tunnels request failed", http.StatusBadGateway)
-					return
-				}
-				tunnelsResponseBytes, err := ioutil.ReadAll(tunnelsResponse.Body)
-				if err != nil {
-					log.Printf("clientAdminAPI: tunnelsResponse read error: %+v\n\n", err)
-					http.Error(response, "502 tunnelsResponse read error", http.StatusBadGateway)
-					return
-				}
-
-				if tunnelsResponse.StatusCode != http.StatusOK {
-					log.Printf(
-						"clientAdminAPI: tunnelsRequest returned HTTP %d: %s\n\n",
-						tunnelsResponse.StatusCode, string(tunnelsResponseBytes),
-					)
-					http.Error(
-						response,
-						fmt.Sprintf("502 tunnels request returned HTTP %d: %s", tunnelsResponse.StatusCode, string(tunnelsResponseBytes)),
-						http.StatusBadGateway,
-					)
-					return
-				}
 			}
 
 			if &configUpdate.ServiceToLocalAddrMap != nil {
 				serviceToLocalAddrMap = &configUpdate.ServiceToLocalAddrMap
-			}
-
-			// cache the listeners locally for use in test mode.
-			testModeListeners = map[string]ListenerConfig{}
-			for _, listener := range configUpdate.Listeners {
-				testModeListeners[listener.BackEndService] = listener
 			}
 
 			response.Header().Add("content-type", "application/json")
@@ -557,6 +616,50 @@ func (handler clientAdminAPI) ServeHTTP(response http.ResponseWriter, request *h
 		http.Error(response, "404 not found, try PUT /liveconfig or PUT/GET /testmode", http.StatusNotFound)
 	}
 
+}
+
+func updateListenersOnServer(listeners []ListenerConfig) error {
+	sendBytes, err := json.Marshal(listeners)
+	if err != nil {
+		return errors.Wrap(err, "Listeners json serialization failed")
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsClientConfig,
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	// TODO make this concurrent requests, not one by one.
+	for _, server := range clientServers {
+		apiURL := fmt.Sprintf("https://%s/tunnels", server.ServerHostPort)
+		tunnelsRequest, err := http.NewRequest("PUT", apiURL, bytes.NewReader(sendBytes))
+		if err != nil {
+			return errors.Wrap(err, "error creating tunnels request")
+		}
+		tunnelsRequest.Header.Add("content-type", "application/json")
+
+		tunnelsResponse, err := client.Do(tunnelsRequest)
+		if err != nil {
+			return errors.Wrap(err, "tunnels request failed")
+		}
+		tunnelsResponseBytes, err := ioutil.ReadAll(tunnelsResponse.Body)
+		if err != nil {
+			return errors.Wrap(err, "tunnels request response read error")
+		}
+
+		if tunnelsResponse.StatusCode != http.StatusOK {
+			return errors.Errorf("tunnelsRequest returned HTTP %d: %s", tunnelsResponse.StatusCode, string(tunnelsResponseBytes))
+		}
+	}
+
+	// cache the listeners locally for use in test mode.
+	testModeListeners = map[string]ListenerConfig{}
+	for _, listener := range listeners {
+		testModeListeners[listener.BackEndService] = listener
+	}
+
+	return nil
 }
 
 func handleTestConnection(remote net.Conn, msg *proto.ControlMessage) {
@@ -664,4 +767,92 @@ func GenerateTestX509Cert() (tls.Certificate, error) {
 	outCert.PrivateKey = priv
 
 	return outCert, nil
+}
+
+func getProxyDialer(socks5Address string) (proxy.Dialer, error) {
+	if strings.HasPrefix(strings.ToLower(socks5Address), "gateway") {
+		splitAddress := strings.Split(socks5Address, ":")
+		if len(splitAddress) != 2 {
+			return nil, errors.Errorf("can't getProxyDialer() because HostileNetworkEnvironmentEvasionSOCKS5Address '%s' was invalid. should be of the form host:port")
+		}
+		port := splitAddress[1]
+		defaultGateways, err := getDefaultGatewaysFromRoutingTable()
+		if err != nil {
+			return nil, errors.Errorf("can't getProxyDialer() because HostileNetworkEnvironmentEvasionSOCKS5Address was set to '%s' but: \n%+v\n", socks5Address, err)
+		}
+		if len(defaultGateways) == 0 {
+			return nil, errors.Errorf(
+				"can't getProxyDialer() because HostileNetworkEnvironmentEvasionSOCKS5Address was set to '%s' but no default gateways were found in routing table",
+				socks5Address,
+			)
+		}
+
+		failures := make([]string, len(defaultGateways))
+		for i := 0; i < len(defaultGateways); i++ {
+			address := fmt.Sprintf("%s:%s", defaultGateways[i], port)
+			conn, err := net.Dial("tcp", address)
+			if err == nil {
+				conn.Close()
+				return proxy.SOCKS5("tcp", address, nil, proxy.Direct)
+			}
+			failures = append(failures, fmt.Sprintf("can't connect to %s", address))
+		}
+
+		// if we got this far it means we tried them all and none of them worked.
+		return nil, errors.Errorf("can't connect to HostileNetworkEnvironmentEvasionSOCKS5Address '%s': %s", socks5Address, strings.Join(failures, ", "))
+	} else {
+		conn, err := net.Dial("tcp", socks5Address)
+		if err != nil {
+			return nil, errors.Errorf("can't connect to HostileNetworkEnvironmentEvasionSOCKS5Address '%s': %s", socks5Address, err)
+		}
+		conn.Close()
+
+		return proxy.SOCKS5("tcp", socks5Address, nil, proxy.Direct)
+	}
+}
+
+// https://stackoverflow.com/questions/40682760/what-syscall-method-could-i-use-to-get-the-default-network-gateway
+func getDefaultGatewaysFromRoutingTable() ([]string, error) {
+
+	if runtime.GOOS != "linux" {
+		return nil, errors.Errorf("getDefaultGatewaysFromRoutingTable() does not support %s operating system yet.", runtime.GOOS)
+	}
+	toReturn := []string{}
+
+	file, err := os.Open("/proc/net/route")
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if scanner.Scan() { // skip the first line (header)
+		for scanner.Scan() {
+			tokens := strings.Split(scanner.Text(), "\t")
+			destinationHex := "0x" + tokens[1]
+			gatewayHex := "0x" + tokens[2]
+
+			destinationInt, err := strconv.ParseInt(destinationHex, 0, 64)
+			if err != nil {
+				return nil, err
+			}
+			gatewayInt, err := strconv.ParseInt(gatewayHex, 0, 64)
+			if err != nil {
+				return nil, err
+			}
+			// 0 means 0.0.0.0 -- we are looking for default routes, routes that have universal destination 0.0.0.0
+			if destinationInt == 0 && gatewayInt != 0 {
+				gatewayUint32 := uint32(gatewayInt)
+
+				// make net.IP address from uint32
+				ip := make(net.IP, 4)
+				binary.LittleEndian.PutUint32(ip, gatewayUint32)
+
+				toReturn = append(toReturn, ip.String())
+				//fmt.Printf("%T --> %[1]v\n", ipBytes)
+			}
+		}
+	}
+
+	return toReturn, nil
 }

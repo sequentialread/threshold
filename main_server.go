@@ -361,7 +361,7 @@ func setListeners(tenantId string, listenerConfigs []ListenerConfig) (int, strin
 
 			if err != nil {
 				if strings.Contains(err.Error(), "already in use") {
-					return http.StatusConflict, fmt.Sprintf("Port Conflict: Port %s is reserved or already in use", listenAddress)
+					return http.StatusConflict, fmt.Sprintf("Port Conflict: Port %s:%d is reserved or already in use", listenAddress, newListenerConfig.ListenPort)
 				}
 
 				log.Printf("setListeners(): can't net.Listen(\"tcp\", \"%s\")  because %s \n", listenAddress, err)
