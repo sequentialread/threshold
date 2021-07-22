@@ -240,35 +240,59 @@ type ConnWithMetrics struct {
 	inbound        bool
 	service        string
 	clientId       string
+	inboundBytes   int
+	outboundBytes  int
 	remoteAddress  net.Addr
 }
 
 func (conn ConnWithMetrics) Read(b []byte) (n int, err error) {
 	n, err = conn.underlying.Read(b)
-	conn.metricsChannel <- BandwidthMetric{
-		Inbound:       conn.inbound,
-		ClientId:      conn.clientId,
-		RemoteAddress: conn.remoteAddress,
-		Service:       conn.service,
-		Bytes:         n,
-	}
+	conn.Accumulate(conn.inbound, n)
 	return n, err
 }
 
 func (conn ConnWithMetrics) Write(b []byte) (n int, err error) {
 	n, err = conn.underlying.Write(b)
+	conn.Accumulate(!conn.inbound, n)
+	return n, err
+}
+
+func (conn ConnWithMetrics) Close() error {
+	if conn.inboundBytes > 0 {
+		conn.PushMetric(true, conn.inboundBytes)
+	}
+	if conn.outboundBytes > 0 {
+		conn.PushMetric(false, conn.outboundBytes)
+	}
+	return conn.underlying.Close()
+}
+
+func (conn ConnWithMetrics) Accumulate(inbound bool, n int) {
+	if inbound {
+		conn.inboundBytes += n
+
+		if conn.inboundBytes > metricChunkSize {
+			conn.PushMetric(true, conn.inboundBytes)
+			conn.inboundBytes = 0
+		}
+	} else {
+		conn.outboundBytes += n
+
+		if conn.outboundBytes > metricChunkSize {
+			conn.PushMetric(false, conn.outboundBytes)
+			conn.outboundBytes = 0
+		}
+	}
+}
+
+func (conn ConnWithMetrics) PushMetric(inbound bool, n int) {
 	conn.metricsChannel <- BandwidthMetric{
-		Inbound:       !conn.inbound,
+		Inbound:       inbound,
 		ClientId:      conn.clientId,
 		RemoteAddress: conn.remoteAddress,
 		Service:       conn.service,
 		Bytes:         n,
 	}
-	return n, err
-}
-
-func (conn ConnWithMetrics) Close() error {
-	return conn.underlying.Close()
 }
 
 func (conn ConnWithMetrics) LocalAddr() net.Addr {

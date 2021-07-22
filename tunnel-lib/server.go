@@ -506,6 +506,7 @@ func (s *Server) listenControl(ct *control) {
 		}
 
 		if msg.Action == proto.RequestForwardProxy {
+			log.Printf("Server.listenControl(): connectionId: %d s.getSession(%s)\n", connectionId, ct.identifier)
 			session, err := s.getSession(ct.identifier)
 			if err != nil {
 				fmt.Printf(
@@ -513,6 +514,7 @@ func (s *Server) listenControl(ct *control) {
 					connectionId, ct.identifier, err,
 				)
 			}
+			log.Printf("Server.listenControl(): connectionId: %d session.Open()\n", connectionId)
 			remote, err := session.Open()
 			if err != nil {
 				fmt.Printf(
@@ -529,6 +531,8 @@ func (s *Server) listenControl(ct *control) {
 					inbound:        false,
 					clientId:       ct.identifier,
 				}
+
+				log.Printf("Server.listenControl(): connectionId: %d s.socks5Server.ServeConn(metricsWrappedConn)\n", connectionId)
 				err := s.socks5Server.ServeConn(metricsWrappedConn)
 				if err != nil {
 					fmt.Printf(

@@ -115,7 +115,7 @@ func runServer(configFileName *string) {
 
 	// the Server should only collect metrics when in multi-tenant mode -- this is needed for billing
 	if config.MultiTenantMode {
-		metricChannel = make(chan tunnel.BandwidthMetric)
+		metricChannel = make(chan tunnel.BandwidthMetric, 4096)
 	}
 
 	tunnelServerConfig := &tunnel.ServerConfig{

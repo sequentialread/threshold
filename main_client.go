@@ -409,7 +409,7 @@ func runClient(configFileName *string) {
 	if config.MaximumConnectionRetrySeconds != 0 {
 		maximumConnectionRetrySeconds = config.MaximumConnectionRetrySeconds
 	}
-	for _, server := range clientServers {
+	for i, server := range clientServers {
 		// make a separate backoff instance for each server.
 		myBackoff := maximumBackoff{
 			Maximum: time.Second * time.Duration(maximumConnectionRetrySeconds),
@@ -454,6 +454,7 @@ func runClient(configFileName *string) {
 		})()
 
 		server.Client = client
+		clientServers[i] = server
 		go server.Client.Start()
 	}
 
@@ -474,6 +475,7 @@ func runClient(configFileName *string) {
 		}
 
 		// TODO better way of determining which one to use for forward proxy.
+		// log.Printf("clientServers: %+v, clientServers[0]: %+v\n", clientServers, clientServers[0])
 		err = clientServers[0].Client.HandleForwardProxy(conn)
 		if err != nil {
 			log.Printf("Can't accept incoming connection %s -> %s because %s\n", conn.RemoteAddr, conn.LocalAddr, err)
