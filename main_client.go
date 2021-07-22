@@ -130,13 +130,13 @@ func runClient(configFileName *string) {
 		config.GreenhouseThresholdPort = 9056
 	}
 	if config.TunneledOutboundSOCKS5ListenAddress == "" {
-		config.TunneledOutboundSOCKS5ListenAddress = "127.0.0.1:8000"
+		config.TunneledOutboundSOCKS5ListenAddress = "127.0.0.1:1080"
 	}
-	TunneledOutboundSOCKS5ListenAddress, err := net.ResolveTCPAddr("tcp", config.TunneledOutboundSOCKS5ListenAddress)
+	tunneledOutboundSOCKS5ListenAddress, err := net.ResolveTCPAddr("tcp", config.TunneledOutboundSOCKS5ListenAddress)
 	if err != nil {
 		log.Fatalf("runClient(): can't net.ResolveTCPAddr(TunneledOutboundSOCKS5ListenAddress) because %s \n", err)
 	}
-	forwardProxyListener, err := net.ListenTCP("tcp", TunneledOutboundSOCKS5ListenAddress)
+	forwardProxyListener, err := net.ListenTCP("tcp", tunneledOutboundSOCKS5ListenAddress)
 	if err != nil {
 		log.Fatalf("runClient(): can't net.ListenTCP(\"tcp\", TunneledOutboundSOCKS5ListenAddress) because %s \n", err)
 	}

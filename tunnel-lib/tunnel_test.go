@@ -177,7 +177,7 @@ func TestNoHost(t *testing.T) {
 		Identifier: "unknown",
 		ServerAddr: tt.ServerAddr().String(),
 		Backoff:    noBackoff,
-		Debug:      testing.Verbose(),
+		DebugLog:   true,
 	})
 	if err != nil {
 		t.Fatalf("client error: %s", err)
