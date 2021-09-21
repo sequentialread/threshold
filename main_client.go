@@ -187,7 +187,7 @@ func runClient(configFileName *string) {
 			} else {
 				log.Printf("Greenhouse server %s could not be reached: %s", greenhouseURL, err)
 			}
-			log.Printf("falling back to DNS lookup...\n", greenhouseURL)
+			log.Printf("falling back to DNS lookup on '%s'...\n", greenhouseURL)
 			ips, err := net.LookupIP(config.GreenhouseDomain)
 			if err != nil {
 				log.Fatalf("Failed to lookup GreenhouseDomain '%s'", config.GreenhouseDomain)
