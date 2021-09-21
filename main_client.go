@@ -129,16 +129,16 @@ func runClient(configFileName *string) {
 	if config.GreenhouseThresholdPort == 0 {
 		config.GreenhouseThresholdPort = 9056
 	}
-	if config.TunneledOutboundSOCKS5ListenAddress == "" {
-		config.TunneledOutboundSOCKS5ListenAddress = "127.0.0.1:1080"
-	}
-	tunneledOutboundSOCKS5ListenAddress, err := net.ResolveTCPAddr("tcp", config.TunneledOutboundSOCKS5ListenAddress)
-	if err != nil {
-		log.Fatalf("runClient(): can't net.ResolveTCPAddr(TunneledOutboundSOCKS5ListenAddress) because %s \n", err)
-	}
-	forwardProxyListener, err := net.ListenTCP("tcp", tunneledOutboundSOCKS5ListenAddress)
-	if err != nil {
-		log.Fatalf("runClient(): can't net.ListenTCP(\"tcp\", TunneledOutboundSOCKS5ListenAddress) because %s \n", err)
+	var forwardProxyListener *net.TCPListener
+	if config.TunneledOutboundSOCKS5ListenAddress != "" {
+		tunneledOutboundSOCKS5ListenAddress, err := net.ResolveTCPAddr("tcp", config.TunneledOutboundSOCKS5ListenAddress)
+		if err != nil {
+			log.Fatalf("runClient(): can't net.ResolveTCPAddr(TunneledOutboundSOCKS5ListenAddress) because %s \n", err)
+		}
+		forwardProxyListener, err = net.ListenTCP("tcp", tunneledOutboundSOCKS5ListenAddress)
+		if err != nil {
+			log.Fatalf("runClient(): can't net.ListenTCP(\"tcp\", TunneledOutboundSOCKS5ListenAddress) because %s \n", err)
+		}
 	}
 
 	clientServers = []ClientServer{}
@@ -180,12 +180,14 @@ func runClient(configFileName *string) {
 		if err != nil || response.StatusCode != 200 {
 			if err == nil {
 				if response.StatusCode == 401 {
-					log.Fatalf("bad or expired GreenhouseAPIToken, recieved HTTP 401 Unauthorized from Greenhouse server %s", greenhouseURL)
+					log.Printf("bad or expired GreenhouseAPIToken, recieved HTTP 401 Unauthorized from Greenhouse server %s", greenhouseURL)
 				} else {
-					log.Fatalf("server error: recieved HTTP %d from Greenhouse server %s", response.StatusCode, greenhouseURL)
+					log.Printf("recieved HTTP %d from Greenhouse server %s", response.StatusCode, greenhouseURL)
 				}
+			} else {
+				log.Printf("Greenhouse server %s could not be reached: %s", greenhouseURL, err)
 			}
-			log.Printf("can't reach %s, falling back to DNS lookup...\n", greenhouseURL)
+			log.Printf("falling back to DNS lookup...\n", greenhouseURL)
 			ips, err := net.LookupIP(config.GreenhouseDomain)
 			if err != nil {
 				log.Fatalf("Failed to lookup GreenhouseDomain '%s'", config.GreenhouseDomain)
@@ -468,20 +470,24 @@ func runClient(configFileName *string) {
 		config.TunneledOutboundSOCKS5ListenAddress,
 	)
 
-	for {
-		conn, err := forwardProxyListener.Accept()
-		if err != nil {
-			log.Printf("Can't accept incoming connection: forwardProxyListener.Accept() returned %s\n", err)
-		}
+	if forwardProxyListener != nil {
+		for {
+			conn, err := forwardProxyListener.Accept()
+			if err != nil {
+				log.Printf("Can't accept incoming connection: forwardProxyListener.Accept() returned %s\n", err)
+			}
 
-		// TODO better way of determining which one to use for forward proxy.
-		// log.Printf("clientServers: %+v, clientServers[0]: %+v\n", clientServers, clientServers[0])
-		err = clientServers[0].Client.HandleForwardProxy(conn)
-		if err != nil {
-			log.Printf("Can't accept incoming connection %s -> %s because %s\n", conn.RemoteAddr, conn.LocalAddr, err)
+			// TODO better way of determining which one to use for forward proxy.
+			// log.Printf("clientServers: %+v, clientServers[0]: %+v\n", clientServers, clientServers[0])
+			err = clientServers[0].Client.HandleForwardProxy(conn)
+			if err != nil {
+				log.Printf("Can't accept incoming connection %s -> %s because %s\n", conn.RemoteAddr, conn.LocalAddr, err)
+			}
 		}
+	} else {
+		waitForever := make(chan bool)
+		<-waitForever
 	}
-
 }
 
 func runClientAdminApi(config ClientConfig) {
