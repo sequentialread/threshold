@@ -188,6 +188,8 @@ func runClient(configFileName *string) {
 				log.Printf("Greenhouse server %s could not be reached: %s", greenhouseURL, err)
 			}
 			log.Printf("falling back to DNS lookup on '%s'...\n", greenhouseURL)
+
+			// TODO for _, tunnel := range config.DefaultTunnels
 			ips, err := net.LookupIP(config.GreenhouseDomain)
 			if err != nil {
 				log.Fatalf("Failed to lookup GreenhouseDomain '%s'", config.GreenhouseDomain)
@@ -209,6 +211,8 @@ func runClient(configFileName *string) {
 			}
 
 			for _, serverHostPort := range tenantInfo.ThresholdServers {
+				ip := strings.Split(serverHostPort, ":")[0]
+				serverHostPort = fmt.Sprintf("%s:%d", ip, config.GreenhouseThresholdPort)
 				clientServers = append(clientServers, makeServer(serverHostPort))
 				hostPortStringsToLog = append(hostPortStringsToLog, serverHostPort)
 			}
@@ -371,6 +375,32 @@ func runClient(configFileName *string) {
 		}
 
 		addressSplit := strings.Split(address, ":")
+
+		// log.Printf("ASD!! LEN: %d\n", len(tlsClientConfig.Certificates))
+		// if len(tlsClientConfig.Certificates) > 0 {
+		// 	for i, cert := range tlsClientConfig.Certificates {
+
+		// 		log.Printf("cert[%d]\n", i)
+
+		// 		if cert.Leaf != nil {
+		// 			bytez := pem.EncodeToMemory(&pem.Block{
+		// 				Bytes: cert.Leaf.Raw,
+		// 				Type:  "CERTIFICATE",
+		// 			})
+		// 			log.Printf("cert[%d].Leaf.Raw:\n%s\n\n", i, bytez)
+		// 		}
+		// 		if cert.Certificate != nil {
+		// 			for j, bytez := range cert.Certificate {
+		// 				bytez2 := pem.EncodeToMemory(&pem.Block{
+		// 					Bytes: bytez,
+		// 					Type:  "CERTIFICATE",
+		// 				})
+		// 				log.Printf("cert[%d][%d].Raw:\n%s\n\n", i, j, bytez2)
+		// 			}
+		// 		}
+		// 	}
+		// }
+
 		tlsConn := tls.Client(conn, &tls.Config{
 			ServerName:   addressSplit[0],
 			Certificates: tlsClientConfig.Certificates,
@@ -378,6 +408,7 @@ func runClient(configFileName *string) {
 		})
 		err = tlsConn.Handshake()
 		if err != nil {
+			log.Printf("tlsConn.Handshake() ERROR %+v\n", err)
 			return nil, err
 		}
 		return tlsConn, nil
@@ -465,12 +496,12 @@ func runClient(configFileName *string) {
 		serverListToLog,
 	)
 
-	log.Printf(
-		"runClient(): I am listening on %s for SOCKS5 forward proxy \n",
-		config.TunneledOutboundSOCKS5ListenAddress,
-	)
-
 	if forwardProxyListener != nil {
+		log.Printf(
+			"runClient(): I am listening on %s for SOCKS5 forward proxy \n",
+			config.TunneledOutboundSOCKS5ListenAddress,
+		)
+
 		for {
 			conn, err := forwardProxyListener.Accept()
 			if err != nil {
