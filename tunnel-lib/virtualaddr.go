@@ -16,9 +16,9 @@ type ListenerInfo struct {
 	//Send the HAProxy PROXY protocol v1 header to the proxy client before streaming TCP from the remote client.
 	SendProxyProtocolv1 bool
 
-	BackendService           string
-	AssociatedClientIdentity string
-	HostnameGlob             string
+	BackendService     string
+	AssociatedClientId string
+	HostnameGlob       string
 }
 
 type listener struct {
@@ -46,13 +46,20 @@ type vaddrStorage struct {
 	//  ports     map[int]*listener // port-based routing: maps port number to identifier
 	//	ips       map[string]*listener // ip-based routing: maps ip address to identifier
 
+	httpHostRegex *regexp.Regexp
+	dotRegex      *regexp.Regexp
+	globRegex     *regexp.Regexp
+
 	mu sync.RWMutex
 }
 
 func newVirtualAddrs(opts *vaddrOptions) *vaddrStorage {
 	return &vaddrStorage{
-		vaddrOptions: opts,
-		listeners:    make(map[string]*listener),
+		vaddrOptions:  opts,
+		listeners:     make(map[string]*listener),
+		httpHostRegex: regexp.MustCompile("[A-Z]+ [^ ]+ HTTP[^\n]+\n([A-Za-z0-9-]+: [^\n]+\n)*(H|h)ost: ([^\n]+)\n"),
+		dotRegex:      regexp.MustCompile(`\.`),
+		globRegex:     regexp.MustCompile(`\*+`),
 		//      ports:        make(map[int]*listener),
 		//		ips:          make(map[string]*listener),
 	}
@@ -65,13 +72,13 @@ func (l *listener) serve() {
 			log.Printf("listener.serve(): failue listening on %q: %s\n", l.Addr(), err)
 			return
 		}
-
+		log.Println(1)
 		if atomic.LoadInt32(&l.done) != 0 {
 			log.Printf("listener.serve(): stopped serving %q", l.Addr())
 			conn.Close()
 			return
 		}
-
+		log.Println(2)
 		l.connCh <- conn
 	}
 }
@@ -142,10 +149,10 @@ func (vaddr *vaddrStorage) Add(ip net.IP, port int, hostnameGlob string, ident s
 
 func (l *listener) addHost(hostnameGlob string, ident string, sendProxyProtocolv1 bool, service string) {
 	l.backends = append(l.backends, ListenerInfo{
-		HostnameGlob:             hostnameGlob,
-		AssociatedClientIdentity: ident,
-		SendProxyProtocolv1:      sendProxyProtocolv1,
-		BackendService:           service,
+		HostnameGlob:        hostnameGlob,
+		AssociatedClientId:  ident,
+		SendProxyProtocolv1: sendProxyProtocolv1,
+		BackendService:      service,
 	})
 }
 
@@ -201,12 +208,13 @@ func (vaddr *vaddrStorage) Delete(ip net.IP, port int, hostnameGlob string) {
 
 func (vaddr *vaddrStorage) newListener(ip net.IP, port int) (*listener, error) {
 	listenAddress := net.JoinHostPort(ip.String(), strconv.Itoa(port))
-	fmt.Printf("now listening on %s\n\n", listenAddress)
 
 	netListener, err := net.Listen("tcp", listenAddress)
 	if err != nil {
 		return nil, err
 	}
+
+	fmt.Printf("now listening on %s\n\n", listenAddress)
 
 	return &listener{
 		Listener:     netListener,
@@ -217,7 +225,7 @@ func (vaddr *vaddrStorage) newListener(ip net.IP, port int) (*listener, error) {
 func (vaddr *vaddrStorage) HasIdentifier(identifier string) bool {
 	for _, listener := range vaddr.listeners {
 		for _, backend := range listener.backends {
-			if backend.AssociatedClientIdentity == identifier {
+			if backend.AssociatedClientId == identifier {
 				return true
 			}
 		}
@@ -231,14 +239,38 @@ func (vaddr *vaddrStorage) HasIdentifier(identifier string) bool {
 }
 
 func (vaddr *vaddrStorage) getListenerInfo(conn net.Conn) (*ListenerInfo, string, []byte) {
-	vaddr.mu.Lock()
-	defer vaddr.mu.Unlock()
+
+	// TODO maybe want to figure out how to set the read timeout lower for this ??
+	connectionHeader := make([]byte, 4096)
+	n, err := conn.Read(connectionHeader)
+	if err != nil && err != io.EOF {
+		log.Printf("vaddrStorage.getListenerInfo(): failed to read header for connection %q: %s", conn.LocalAddr(), err)
+		return nil, "", make([]byte, 0)
+	}
+
+	hostname, err := getHostnameFromSNI(connectionHeader[:n])
+
+	if err != nil {
+		// If we failed to get the hostname from SNI, try to get it from HTTP/1.1
+
+		submatches := vaddr.httpHostRegex.FindSubmatch(connectionHeader[:n])
+		//log.Printf("--\n%d\n--\n", len(submatches))
+		if submatches != nil && len(submatches) == 4 {
+			//log.Printf("---\n\n%s\n\n%s\n\n%s\n\n---\n", string(submatches[1]), string(submatches[2]), string(submatches[3]))
+			// Trim any space or port number that might be on the host
+			split := strings.Split(strings.TrimSpace(string(submatches[3])), ":")
+			hostname = split[0]
+		}
+	}
 
 	host, port, err := parseHostPort(conn.LocalAddr().String())
 	if err != nil {
 		log.Printf("vaddrStorage.getListenerInfo(): failed to get identifier for connection %q: %s", conn.LocalAddr(), err)
 		return nil, "", make([]byte, 0)
 	}
+
+	vaddr.mu.Lock()
+	defer vaddr.mu.Unlock()
 
 	for _, listener := range vaddr.listeners {
 		listenerHost, listenerPort, err := parseHostPort(listener.localAddr())
@@ -256,42 +288,32 @@ func (vaddr *vaddrStorage) getListenerInfo(conn net.Conn) (*ListenerInfo, string
 
 		if err == nil && listenHostMatches && listenPortMatches {
 
-			//log.Printf("pre getHostnameFromSNI ")
-
-			connectionHeader := make([]byte, 1024)
-			n, err := conn.Read(connectionHeader)
-			if err != nil && err != io.EOF {
-				log.Printf("vaddrStorage.getListenerInfo(): failed to read header for connection %q: %s", conn.LocalAddr(), err)
-				return nil, "", make([]byte, 0)
-			}
-
-			hostname, err := getHostnameFromSNI(connectionHeader[:n])
-
-			// This will happen every time someone connects with a non-TLS protocol.
-			// Its not a big deal, we can ignore it.
-			// if err != nil {
-			// 	log.Printf("vaddrStorage.getListenerInfo(): failed to get SNI for connection %q: %s\n", conn.LocalAddr(), err)
-			// }
-
-			//log.Printf("getHostnameFromSNI: %s\n", hostname)
-
 			recordSpecificity := -10
-			var mostSpecificMatchingBackend *ListenerInfo = nil
+			mostSpecificMatchingBackend := ListenerInfo{}
+			hasMatchingBackend := false
 			for _, backend := range listener.backends {
 				globToUse := backend.HostnameGlob
 				if globToUse == "" {
 					globToUse = "*"
 				}
-				numberOfPeriods := len(regexp.MustCompile(`\.`).FindAllString(globToUse, -1))
-				numberOfGlobs := len(regexp.MustCompile(`\*+`).FindAllString(globToUse, -1))
+				numberOfPeriods := len(vaddr.dotRegex.FindAllString(globToUse, -1))
+				numberOfGlobs := len(vaddr.globRegex.FindAllString(globToUse, -1))
 				specificity := numberOfPeriods - numberOfGlobs
+				log.Printf("%d > %d && Glob(%s, %s)->(%t)\n", specificity, recordSpecificity, globToUse, hostname, Glob(globToUse, hostname))
 				if specificity > recordSpecificity && Glob(globToUse, hostname) {
 					recordSpecificity = specificity
-					mostSpecificMatchingBackend = &backend
+					mostSpecificMatchingBackend = backend
+					hasMatchingBackend = true
+					log.Printf("mostSpecificMatchingBackend: %s->%s\n", mostSpecificMatchingBackend.AssociatedClientId, mostSpecificMatchingBackend.BackendService)
 				}
 			}
 
-			return mostSpecificMatchingBackend, hostname, connectionHeader[:n]
+			if hasMatchingBackend {
+				return &mostSpecificMatchingBackend, hostname, connectionHeader[:n]
+			} else {
+				return nil, hostname, connectionHeader[:n]
+			}
+
 		}
 	}
 

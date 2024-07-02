@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	tunnel "git.sequentialread.com/forest/tunnel/tunnel-lib"
+	tunnel "git.sequentialread.com/forest/threshold/tunnel-lib"
 )
 
 var debugNet = os.Getenv("DEBUGNET") == "1"
@@ -185,7 +185,7 @@ func NewTunnelTest() (*TunnelTest, error) {
 
 	cfg := &tunnel.ServerConfig{
 		StateChanges: rec.C(),
-		Debug:        testing.Verbose(),
+		DebugLog:     true,
 	}
 	s, err := tunnel.NewServer(cfg)
 	if err != nil {
@@ -266,19 +266,15 @@ func (tt *TunnelTest) serveSingle(ident string, t *Tunnel) (bool, error) {
 		l = dbgListener{l}
 	}
 
-	localAddr := l.Addr().String()
-	httpProxy := &tunnel.HTTPProxy{LocalAddr: localAddr}
+	//localAddr := l.Addr().String()
 	tcpProxy := &tunnel.TCPProxy{FetchLocalAddr: tt.fetchLocalAddr}
 
 	cfg := &tunnel.ClientConfig{
-		Identifier: ident,
-		ServerAddr: tt.ServerAddr().String(),
-		Proxy: tunnel.Proxy(tunnel.ProxyFuncs{
-			HTTP: httpProxy.Proxy,
-			TCP:  tcpProxy.Proxy,
-		}),
+		Identifier:   ident,
+		ServerAddr:   tt.ServerAddr().String(),
+		Proxy:        tcpProxy.Proxy,
 		StateChanges: t.StateChanges,
-		Debug:        testing.Verbose(),
+		DebugLog:     true,
 	}
 
 	// Register tunnel:
@@ -317,6 +313,7 @@ func (tt *TunnelTest) serveSingle(ident string, t *Tunnel) (bool, error) {
 			remote = tt.Listeners[t.RemoteAddrIdent][1]
 			tt.mu.Unlock()
 		} else {
+			net.ResolveTCPAddr("tcp", t.RemoteAddr)
 			remote, err = net.Listen("tcp", t.RemoteAddr)
 			if err != nil {
 				return false, fmt.Errorf("failed to listen on %q for %q tunnel: %s", t.RemoteAddr, ident, err)
@@ -331,7 +328,9 @@ func (tt *TunnelTest) serveSingle(ident string, t *Tunnel) (bool, error) {
 			addrIdent = t.ClientIdent
 		}
 
-		tt.Server.AddAddr(remote, t.IP, addrIdent)
+		// TODO this whole thing  needs to be refactored because tt.Server.AddAddr does not accept a listener as an argument any more.
+		// Used to be like: tt.Server.AddAddr(remote, blahblahblah)
+		tt.Server.AddAddr(t.IP, 8080, "*", addrIdent, true, t.RemoteAddr)
 
 		tt.mu.Lock()
 		tt.Listeners[ident] = [2]net.Listener{l, remote}
@@ -432,7 +431,7 @@ func (tt *TunnelTest) popServedDeps(tunnels map[string]*Tunnel) error {
 	return nil
 }
 
-func (tt *TunnelTest) fetchLocalAddr(port int) (string, error) {
+func (tt *TunnelTest) fetchLocalAddr(service string) (string, error) {
 	tt.mu.Lock()
 	defer tt.mu.Unlock()
 
@@ -442,17 +441,18 @@ func (tt *TunnelTest) fetchLocalAddr(port int) (string, error) {
 			continue
 		}
 
-		_, remotePort, err := parseHostPort(l[1].Addr().String())
-		if err != nil {
-			return "", err
-		}
+		remotePort := l[1].Addr().String()
+		// _, remotePort, err := parseHostPort()
+		// if err != nil {
+		// 	return "", err
+		// }
 
-		if port == remotePort {
+		if service == remotePort {
 			return l[0].Addr().String(), nil
 		}
 	}
 
-	return "", fmt.Errorf("no route for %d port", port)
+	return "", fmt.Errorf("no route for %s service string", service)
 }
 
 func (tt *TunnelTest) ServerAddr() net.Addr {

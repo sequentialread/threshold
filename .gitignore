@@ -1,3 +1,5 @@
 build
 dockerbuild
 localbuild.sh
+config.json
+threshold

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	tunnel "git.sequentialread.com/forest/tunnel/tunnel-lib"
+	tunnel "git.sequentialread.com/forest/threshold/tunnel-lib"
 )
 
 var (

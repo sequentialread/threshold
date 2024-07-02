@@ -4,7 +4,6 @@
 package tunnel
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,14 +15,17 @@ import (
 	"sync"
 	"time"
 
-	"git.sequentialread.com/forest/tunnel/tunnel-lib/proto"
+	errors "git.sequentialread.com/forest/pkg-errors"
+	"git.sequentialread.com/forest/threshold/tunnel-lib/proto"
 
+	"github.com/armon/go-socks5"
 	"github.com/hashicorp/yamux"
 )
 
 var (
 	errNoClientSession = errors.New("no client session established")
 	defaultTimeout     = 10 * time.Second
+	metricChunkSize    = 1000000 // one megabyte
 )
 
 // Server is responsible for proxying public connections to the client over a
@@ -39,6 +41,8 @@ type Server struct {
 	sessions map[string]*yamux.Session
 	// sessionsMu protects sessions.
 	sessionsMu sync.Mutex
+
+	socks5Server *socks5.Server
 
 	// controls contains the control connection from the client to the server.
 	controls *controls
@@ -70,10 +74,25 @@ type Server struct {
 	// the domain of the server, used for validating clientIds
 	domain string
 
+	bandwidth chan<- BandwidthMetric
+
+	multitenantMode bool
+
+	// see ServerConfig.ValidateCertificate comment
+	validateCertificate func(domain string, multitenantMode bool, request *http.Request) (identifier string, tenantId string, err error)
+
 	// yamuxConfig is passed to new yamux.Session's
 	yamuxConfig *yamux.Config
 
 	debugLog bool
+}
+
+type BandwidthMetric struct {
+	Bytes         int
+	RemoteAddress net.Addr
+	Inbound       bool
+	Service       string
+	ClientId      string
 }
 
 // ServerConfig defines the configuration for the Server
@@ -90,6 +109,19 @@ type ServerConfig struct {
 
 	// the domain of the server, used for validating clientIds
 	Domain string
+
+	Bandwidth chan<- BandwidthMetric
+
+	// function that analyzes the TLS client certificate of the request.
+	// this is based on the CommonName attribute of the TLS certificate.
+	// If we are in multi-tenant mode, it must be formatted like `<tenantId>.<nodeId>@<domain>`
+	//                      otherwise, it must be formatted like         `<nodeId>@<domain>`
+	// <domain> must match the configured Domain of this Threshold server
+	// the identifier it returns will be `<tenantId>.<nodeId>` or `<nodeId>`.
+	// the tenantId it returns will be `<tenantId>` or ""
+	ValidateCertificate func(domain string, multiTenantMode bool, request *http.Request) (identifier string, tenantId string, err error)
+
+	MultitenantMode bool
 
 	// YamuxConfig defines the config which passed to every new yamux.Session. If nil
 	// yamux.DefaultConfig() is used.
@@ -113,14 +145,24 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		connCh: connCh,
 	}
 
+	socks5Server, err := socks5.New(&socks5.Config{})
+
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create new socks5 server")
+	}
+
 	s := &Server{
 		pending:               make(map[string]chan net.Conn),
 		sessions:              make(map[string]*yamux.Session),
+		socks5Server:          socks5Server,
 		onConnectCallbacks:    newCallbacks("OnConnect"),
 		onDisconnectCallbacks: newCallbacks("OnDisconnect"),
 		virtualAddrs:          newVirtualAddrs(opts),
 		controls:              newControls(),
 		states:                make(map[string]ClientState),
+		multitenantMode:       cfg.MultitenantMode,
+		validateCertificate:   cfg.ValidateCertificate,
+		bandwidth:             cfg.Bandwidth,
 		stateCh:               cfg.StateChanges,
 		domain:                cfg.Domain,
 		yamuxConfig:           yamuxConfig,
@@ -140,7 +182,9 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 	// going to infer and call the respective path handlers.
 	switch fmt.Sprintf("%s/", path.Clean(request.URL.Path)) {
 	case proto.ControlPath:
-		s.checkConnect(s.controlHandler).ServeHTTP(responseWriter, request)
+		s.checkConnect(func(w http.ResponseWriter, r *http.Request) error {
+			return s.controlHandler(w, r)
+		}).ServeHTTP(responseWriter, request)
 	case "/ping/":
 		if request.Method == "GET" {
 			fmt.Fprint(responseWriter, "pong!")
@@ -154,11 +198,13 @@ func (s *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Req
 
 func (s *Server) serveTCP() {
 	for conn := range s.connCh {
+		log.Println(3)
 		go s.serveTCPConn(conn)
 	}
 }
 
 func (s *Server) serveTCPConn(conn net.Conn) {
+	log.Println(4)
 	err := s.handleTCPConn(conn)
 	if err != nil {
 		log.Printf("Server.serveTCPConn(): failed to serve %q: %s\n", conn.RemoteAddr(), err)
@@ -167,9 +213,10 @@ func (s *Server) serveTCPConn(conn net.Conn) {
 }
 
 func (s *Server) handleTCPConn(conn net.Conn) error {
-	// TODO getListenerInfo should return the bytes we read to try to get teh hostname
-	// then we stream.write those right after the SendProxyProtocolv1 bit.
+
+	log.Println(5)
 	listenerInfo, sniHostname, connectionHeader := s.virtualAddrs.getListenerInfo(conn)
+	log.Println(6)
 	if listenerInfo == nil {
 		return fmt.Errorf("no virtual host available for %s (hostname: %s)", conn.LocalAddr(), sniHostname)
 	}
@@ -179,12 +226,15 @@ func (s *Server) handleTCPConn(conn net.Conn) error {
 		return err
 	}
 
-	service := strconv.Itoa(port)
+	service := fmt.Sprintf("port%d", port)
 	if listenerInfo.BackendService != "" {
 		service = listenerInfo.BackendService
 	}
-	stream, err := s.dial(listenerInfo.AssociatedClientIdentity, service)
+	log.Printf("7: dial(%s, %s)", listenerInfo.AssociatedClientId, service)
+	stream, err := s.dial(listenerInfo.AssociatedClientId, service)
+	log.Println(8)
 	if err != nil {
+		log.Printf("Server.handleTCPConn(): failed to dial %s on client %s: %s\n", service, listenerInfo.AssociatedClientId, err)
 		return err
 	}
 
@@ -205,28 +255,53 @@ func (s *Server) handleTCPConn(conn net.Conn) error {
 		stream.Write([]byte(fmt.Sprintf("PROXY %s %s %s %s %s\r\n", proxyNetwork, remoteHost, localHost, remotePort, localPort)))
 	}
 
+	log.Println(9)
 	if len(connectionHeader) > 0 {
 		stream.Write(connectionHeader)
 	}
+	log.Println(10)
 
 	disconnectedChan := make(chan bool)
 
-	go s.proxy(disconnectedChan, conn, stream, "from proxy-client to client")
-	go s.proxy(disconnectedChan, stream, conn, "from client to proxy-client")
+	// We don't include remote address or service info here
+	// because the server should only collect the minimum required amount of metric data
+	//  -- the client can collect more detailed metrics if they want.
+
+	inboundMetric := BandwidthMetric{
+		Service:  listenerInfo.BackendService,
+		ClientId: listenerInfo.AssociatedClientId,
+		Inbound:  true,
+	}
+	outboundMetric := BandwidthMetric{
+		Service:  listenerInfo.BackendService,
+		ClientId: listenerInfo.AssociatedClientId,
+		Inbound:  false,
+	}
+
+	go s.proxy(disconnectedChan, conn, stream, outboundMetric, s.bandwidth, "outbound from tunnel to remote client")
+	go s.proxy(disconnectedChan, stream, conn, inboundMetric, s.bandwidth, "inbound from remote client to tunnel")
 
 	// Once one member of this conversation has disconnected, we should end the conversation for all parties.
 	<-disconnectedChan
+	log.Println(11)
 
 	return nonil(stream.Close(), conn.Close())
 }
 
-func (s *Server) proxy(disconnectedChan chan bool, dst, src net.Conn, side string) {
+func (s *Server) proxy(disconnectedChan chan bool, dst, src net.Conn, metric BandwidthMetric, bandwidth chan<- BandwidthMetric, side string) {
 	defer (func() { disconnectedChan <- true })()
 
 	if s.debugLog {
 		log.Printf("Server.proxy(): tunneling %s -> %s (%s)\n", src.RemoteAddr(), dst.RemoteAddr(), side)
 	}
-	n, err := io.Copy(dst, src)
+	var n int64
+	var err error
+	if bandwidth != nil {
+		n, err = ioCopyWithMetrics(dst, src, metric, bandwidth)
+	} else {
+		n, err = io.Copy(dst, src)
+	}
+
 	if s.debugLog {
 		log.Printf("Server.proxy(): tunneled %d bytes %s -> %s (%s): %v\n", n, src.RemoteAddr(), dst.RemoteAddr(), side, err)
 	}
@@ -249,7 +324,7 @@ func (s *Server) dial(identifier string, service string) (net.Conn, error) {
 	}
 
 	if s.debugLog {
-		log.Printf("Server.proxy(): Sending control msg %+v\n", msg)
+		log.Printf("Server.proxy(): Sending control msg %+v to %s \n", msg, identifier)
 	}
 
 	// ask client to open a session to us, so we can accept it
@@ -285,28 +360,13 @@ func (s *Server) dial(identifier string, service string) (net.Conn, error) {
 // controlHandler is used to capture incoming tunnel connect requests into raw
 // tunnel TCP connections.
 func (s *Server) controlHandler(w http.ResponseWriter, r *http.Request) (ctErr error) {
-	identifier := r.Header.Get(proto.ClientIdentifierHeader)
 
-	// When TLS is turned on, the Client Authentication certificate is required, so in that case
-	// if we got to this point, we should make sure
-	// the ClientIdentifier header matches the CommonName on the client cert.
-	// https://stackoverflow.com/questions/31751764/get-remote-ssl-certificate-in-golang
-	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-		cn := r.TLS.PeerCertificates[0].Subject.CommonName
-		if fmt.Sprintf("%s@%s", identifier, s.domain) != cn {
-			return fmt.Errorf(
-				"\"%s: %s\" does not match TLS certificate CommonName %s",
-				proto.ClientIdentifierHeader, identifier, cn,
-			)
-		}
+	clientId, tenantId, err := s.validateCertificate(s.domain, s.multitenantMode, r)
+	fmt.Println(tenantId)
+	if err != nil {
+		return err
 	}
-
-	// We will allow clients to connect even if they are not configured to be used yet.
-	// In this case they have an empty set of listening front-end ports.
-	// ok := s.hasIdentifier(identifier)
-	// if !ok {
-	// 	return fmt.Errorf("no host associated for identifier %s. please use server.AddAddr()", identifier)
-	// }
+	identifier := clientId
 
 	ct, ok := s.getControl(identifier)
 	if ok {
@@ -408,12 +468,19 @@ func (s *Server) controlHandler(w http.ResponseWriter, r *http.Request) (ctErr e
 func (s *Server) listenControl(ct *control) {
 	s.onConnect(ct.identifier)
 
+	connectionId := 0
 	for {
-		var msg map[string]interface{}
+
+		connectionId++
+
+		var msg proto.ControlMessage
 		err := ct.dec.Decode(&msg)
 		if err != nil {
 			if s.debugLog {
-				log.Printf("Server.listenControl(): Closing client connection:  '%s'\n", ct.identifier)
+				log.Printf(
+					"Server.listenControl(): connectionId: %d: Closing  connection for client: '%s'\n",
+					connectionId, ct.identifier,
+				)
 			}
 
 			// close client connection so it reconnects again
@@ -426,7 +493,7 @@ func (s *Server) listenControl(ct *control) {
 			s.onDisconnect(ct.identifier, err)
 
 			if err != io.EOF {
-				log.Printf("Server.listenControl(): decode err: %s\n", err)
+				log.Printf("Server.listenControl(): connectionId: %d decode err: %s\n", connectionId, err)
 			}
 			return
 		}
@@ -435,7 +502,48 @@ func (s *Server) listenControl(ct *control) {
 		// underlying connection needs to establihsed, we know when we have
 		// disconnection(above), so we can cleanup the connection.
 		if s.debugLog {
-			log.Printf("Server.listenControl(): msg: %s\n", msg)
+			log.Printf("Server.listenControl(): connectionId: %d msg: %s\n", connectionId, msg)
+		}
+
+		if msg.Action == proto.RequestForwardProxy {
+			log.Printf("Server.listenControl(): connectionId: %d s.getSession(%s)\n", connectionId, ct.identifier)
+			session, err := s.getSession(ct.identifier)
+			if err != nil {
+				fmt.Printf(
+					"failed to accept RequestForwardProxy from client '%s' connectionId: %d: getSession() returned %s\n",
+					connectionId, ct.identifier, err,
+				)
+			}
+			log.Printf("Server.listenControl(): connectionId: %d session.Open()\n", connectionId)
+			remote, err := session.Open()
+			if err != nil {
+				fmt.Printf(
+					"failed to accept RequestForwardProxy from client '%s' connectionId: %d: session.Open() returned %s\n",
+					connectionId, ct.identifier, err,
+				)
+			}
+
+			go func(connectionId int) {
+				defer remote.Close()
+				metricsWrappedConn := ConnWithMetrics{
+					underlying:     remote,
+					metricsChannel: s.bandwidth,
+					inbound:        false,
+					clientId:       ct.identifier,
+				}
+
+				log.Printf("Server.listenControl(): connectionId: %d s.socks5Server.ServeConn(metricsWrappedConn)\n", connectionId)
+				err := s.socks5Server.ServeConn(metricsWrappedConn)
+				if err != nil {
+					fmt.Printf(
+						"error in RequestForwardProxy from client '%s' connectionId: %d: socks5Server.ServeConn() failed with %s\n",
+						ct.identifier, connectionId, err,
+					)
+				}
+			}(connectionId)
+
+		} else {
+			fmt.Printf("control message from client had action = %d, expected %d\n", msg.Action, proto.RequestForwardProxy)
 		}
 	}
 }
@@ -604,6 +712,7 @@ func copyHeader(dst, src http.Header) {
 
 // checkConnect checks whether the incoming request is HTTP CONNECT method.
 func (s *Server) checkConnect(fn func(w http.ResponseWriter, r *http.Request) error) http.Handler {
+	server := s
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "CONNECT" {
 			http.Error(w, "405 must CONNECT\n", http.StatusMethodNotAllowed)
@@ -613,8 +722,9 @@ func (s *Server) checkConnect(fn func(w http.ResponseWriter, r *http.Request) er
 		if err := fn(w, r); err != nil {
 			log.Printf("Server.checkConnect(): Handler err: %v\n", err.Error())
 
-			if identifier := r.Header.Get(proto.ClientIdentifierHeader); identifier != "" {
-				s.onDisconnect(identifier, err)
+			identifier, _, err := server.validateCertificate(server.domain, server.multitenantMode, r)
+			if err == nil {
+				server.onDisconnect(identifier, err)
 			}
 
 			http.Error(w, err.Error(), 502)

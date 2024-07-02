@@ -8,11 +8,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"git.sequentialread.com/forest/tunnel/tunnel-lib/proto"
+	"git.sequentialread.com/forest/threshold/tunnel-lib/proto"
 
 	"github.com/hashicorp/yamux"
 )
@@ -97,6 +98,8 @@ type Client struct {
 
 	// redialBackoff is used to reconnect in exponential backoff intervals
 	redialBackoff Backoff
+
+	incomingForwardProxyConnections chan net.Conn
 }
 
 // ClientConfig defines the configuration for the Client
@@ -126,7 +129,7 @@ type ClientConfig struct {
 	// where you can provide your local server selection or communication rules.
 	Proxy ProxyFunc
 
-	// Dial provides custom transport layer for client server communication.
+	// Dial provides custom transport layer for communication between the threshold client and threshold server.
 	//
 	// If nil, default implementation is to return net.Dial("tcp", address).
 	//
@@ -199,14 +202,14 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 
 	proxy := cfg.Proxy
 	if proxy == nil {
-		var f ProxyFuncs
-		f.TCP = (&TCPProxy{FetchLocalAddr: cfg.FetchLocalAddr, DebugLog: cfg.DebugLog}).Proxy
-		proxy = Proxy(f)
+		proxy = (&TCPProxy{FetchLocalAddr: cfg.FetchLocalAddr, DebugLog: cfg.DebugLog}).Proxy
 	}
 
-	var bo Backoff = newForeverBackoff()
+	var bo Backoff
 	if cfg.Backoff != nil {
 		bo = cfg.Backoff
+	} else {
+		bo = NewExponentialBackoff()
 	}
 
 	client := &Client{
@@ -431,9 +434,6 @@ func (c *Client) connect(identifier, serverAddr string) error {
 	if err != nil {
 		return fmt.Errorf("error creating request to %s: %s", remoteURL, err)
 	}
-
-	req.Header.Set(proto.ClientIdentifierHeader, identifier)
-
 	if c.config.DebugLog {
 		log.Printf("Client.connect(): Writing request to TCP: %+v\n", req)
 	}
@@ -509,7 +509,29 @@ func (c *Client) connect(identifier, serverAddr string) error {
 
 	c.startNotifyIfNeeded()
 
-	return c.listenControl(ct)
+	// inline immediately invoked function expression to use defer
+	return (func() error {
+		c.ctrlWg.Add(1)
+		defer c.ctrlWg.Done()
+
+		c.incomingForwardProxyConnections = make(chan net.Conn)
+		c.changeState(ClientConnected, nil)
+
+		var err error
+		select {
+		case err = <-async(func() error { return c.listenControl(ct) }):
+			log.Printf("Client.listenControl() exited with: %+v\n", err)
+		case err = <-async(func() error { return c.listenForwardProxy(ct) }):
+			log.Printf("Client.listenForwardProxy() exited with: %+v\n", err)
+		}
+
+		c.session.GoAway()
+		c.session.Close()
+		ct.Close()
+		c.changeState(ClientDisconnected, err)
+		return err
+
+	})()
 }
 
 func (c *Client) dial(serverAddr string) (net.Conn, error) {
@@ -521,27 +543,23 @@ func (c *Client) dial(serverAddr string) (net.Conn, error) {
 }
 
 func (c *Client) listenControl(ct *control) error {
-	c.ctrlWg.Add(1)
-	defer c.ctrlWg.Done()
-
-	c.changeState(ClientConnected, nil)
-
 	for {
 		var msg proto.ControlMessage
 		if err := ct.dec.Decode(&msg); err != nil {
-			c.reqWg.Wait() // wait until all requests are finished
-			c.session.GoAway()
-			c.session.Close()
-			c.changeState(ClientDisconnected, err)
-
 			return fmt.Errorf("failure decoding control message: %s", err)
 		}
 
 		if c.config.DebugLog {
 			log.Printf("Client.connect(): Received control msg %+v\n", msg)
-			log.Println("Client.connect(): Opening a new stream from server session")
 		}
 
+		if msg.Action != proto.RequestClientSession {
+			return fmt.Errorf("control message from server had action = %d, expected %d", msg.Action, proto.RequestClientSession)
+		}
+
+		if c.config.DebugLog {
+			log.Println("Client.connect(): Opening a new stream from server session")
+		}
 		remote, err := c.session.Open()
 		if err != nil {
 			return err
@@ -553,6 +571,54 @@ func (c *Client) listenControl(ct *control) error {
 				log.Println("Client.connect(): Closing server session")
 			}
 			remote.Close()
+		}()
+	}
+}
+
+func (c *Client) HandleForwardProxy(conn net.Conn) error {
+	if c.state != ClientConnected {
+		conn.Close()
+		return errors.New("client is disconnected, can't accept any forward proxy connections")
+	} else {
+		c.incomingForwardProxyConnections <- conn
+		return nil
+	}
+}
+
+func (c *Client) listenForwardProxy(ct *control) error {
+
+	forwardProxyConnectionId := 0
+	for {
+		conn := <-c.incomingForwardProxyConnections
+
+		forwardProxyConnectionId++
+
+		if c.config.DebugLog {
+			log.Printf("Client.listenForwardProxy(): Received incoming forward proxy connection %d\n", forwardProxyConnectionId)
+		}
+
+		err := ct.send(proto.ControlMessage{Action: proto.RequestForwardProxy})
+		if err != nil {
+			return fmt.Errorf("failure sending control message: %s", err)
+		}
+
+		if c.config.DebugLog {
+			log.Printf("Client.listenForwardProxy(): forward proxy connection %d: sent RequestForwardProxy to server \n", forwardProxyConnectionId)
+		}
+
+		remoteConn, err := c.session.Accept()
+		if err != nil {
+			return err
+		}
+
+		if c.config.DebugLog {
+			log.Printf("Client.listenForwardProxy(): forward proxy connection %d: accepted yamux session \n", forwardProxyConnectionId)
+		}
+
+		go func() {
+			blockingBidirectionalPipe(conn, remoteConn, "from client", "to SOCKS server", strconv.Itoa(forwardProxyConnectionId), c.config.DebugLog)
+			conn.Close()
+			remoteConn.Close()
 		}()
 	}
 }

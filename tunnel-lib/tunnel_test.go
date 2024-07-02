@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	tunnel "git.sequentialread.com/forest/tunnel/tunnel-lib"
-	"git.sequentialread.com/forest/tunnel/tunnel-lib/tunneltest"
+	tunnel "git.sequentialread.com/forest/threshold/tunnel-lib"
+	"git.sequentialread.com/forest/threshold/tunnel-lib/tunneltest"
 
 	"github.com/cenkalti/backoff"
 )
@@ -177,7 +177,7 @@ func TestNoHost(t *testing.T) {
 		Identifier: "unknown",
 		ServerAddr: tt.ServerAddr().String(),
 		Backoff:    noBackoff,
-		Debug:      testing.Verbose(),
+		DebugLog:   true,
 	})
 	if err != nil {
 		t.Fatalf("client error: %s", err)

@@ -33,6 +33,7 @@ To edit it, download the <a download href="readme/diagram.drawio">diagram file</
 1. (OPTIONAL) The server operator installs software (for example, email server) which requires outgoing requests to "come from" the same IP address that the server is listening for connections at.
 1. The email server or other software connects to the threshold client for SOCKS5 forward proxy. The threshold client forwards this connection through the existing tunnel connection to the threshold server (secured by TLS), then the threshold server handles the SOCKS5 connection and proxies it to the destination requested by the email server or other software. 
 
+Note: if you wish to easily create server/client key pairs that will work with threshold, see: https://git.sequentialread.com/forest/make-fake-cert
 
 ### Output from Usage example showing how it works:
 
